@@ -1,0 +1,68 @@
+services:
+  dashboard:
+    build: ./dashboard
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./shared_volume:/app/shared_data
+    depends_on:
+      - xai_service
+      - ai_outputs
+    environment:
+      - XAI_SERVICE_URL=${XAI_SERVICE_URL:-http://xai_service:8000}
+      - AI_OUTPUTS_SERVICE_URL=${AI_OUTPUTS_SERVICE_URL:-http://ai_outputs:8001}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
+
+  xai_service:
+    build: ./xai_service
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./shared_volume:/app/shared_data
+    environment:
+      - AI_OUTPUTS_SERVICE_URL=${AI_OUTPUTS_SERVICE_URL:-http://ai_outputs:8001}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
+
+  ai_outputs:
+    build: ./ai_outputs
+    ports:
+      - "8002:8001"
+    volumes:
+      - ./shared_volume:/app/shared_data
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
+      - MAX_FILE_SIZE=${MAX_FILE_SIZE:-10485760}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge

@@ -1,0 +1,1332 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import os
+import json
+import base64
+import io
+import numpy as np
+from datetime import datetime
+import re
+from openai import OpenAI
+from typing import List, Dict, Any, Optional
+import hashlib
+import uuid
+import logging
+import pickle
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+CORS(app)
+
+# Configuration
+SHARED_DATA_DIR = '/app/shared_data'
+RESULTS_FOLDER = os.path.join(SHARED_DATA_DIR, 'results')
+IMAGES_FOLDER = os.path.join(SHARED_DATA_DIR, 'images')
+VECTOR_DB_FOLDER = os.path.join(SHARED_DATA_DIR, 'vector_db')
+
+# Ensure directories exist
+os.makedirs(RESULTS_FOLDER, exist_ok=True)
+os.makedirs(IMAGES_FOLDER, exist_ok=True)
+os.makedirs(VECTOR_DB_FOLDER, exist_ok=True)
+
+# OpenAI Configuration
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+if OPENAI_API_KEY and OPENAI_API_KEY != 'your-openai-api-key':
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    print("OpenAI API key configured successfully.")
+else:
+    print("Warning: OpenAI API key not set. Using fallback responses.")
+    openai_client = None
+
+# Global storage for vector database (in production, use a proper vector DB like Pinecone, Weaviate, etc.)
+user_vector_db = {}
+
+# Store conversation history for each user
+conversation_history = {}
+
+class VectorDatabase:
+    """Simple in-memory vector database with user isolation"""
+    
+    def __init__(self):
+        self.collections = {}
+    
+    def create_user_collection(self, user_id: str):
+        """Create a new collection for a user"""
+        if user_id not in self.collections:
+            self.collections[user_id] = {
+                'documents': [],
+                'embeddings': [],
+                'metadata': []
+            }
+    
+    def add_document(self, user_id: str, text: str, metadata: Dict[str, Any], embedding: List[float] = None):
+        """Add a document to user's collection"""
+        if user_id not in self.collections:
+            self.create_user_collection(user_id)
+        
+        # Generate embedding if not provided
+        if embedding is None:
+            embedding = self._get_embedding(text)
+        else:
+            embedding = embedding
+        
+        self.collections[user_id]['documents'].append(text)
+        self.collections[user_id]['embeddings'].append(embedding)
+        self.collections[user_id]['metadata'].append(metadata)
+    
+    def search(self, user_id: str, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Search for relevant documents"""
+        if user_id not in self.collections:
+            return []
+        
+        query_embedding = self._get_embedding(query)
+        embeddings = self.collections[user_id]['embeddings']
+        documents = self.collections[user_id]['documents']
+        metadata = self.collections[user_id]['metadata']
+        
+        # Calculate cosine similarity
+        similarities = []
+        for i, doc_embedding in enumerate(embeddings):
+            similarity = self._cosine_similarity(query_embedding, doc_embedding)
+            similarities.append((similarity, i))
+        
+        # Sort by similarity and return top_k results
+        similarities.sort(reverse=True)
+        results = []
+        for similarity, idx in similarities[:top_k]:
+            results.append({
+                'text': documents[idx],
+                'metadata': metadata[idx],
+                'similarity': similarity
+            })
+        
+        return results
+    
+    def _get_embedding(self, text: str) -> List[float]:
+        """Get embedding for text using OpenAI"""
+        if openai_client is None:
+            # Fallback: simple hash-based embedding
+            import hashlib
+            hash_obj = hashlib.md5(text.encode())
+            hash_bytes = hash_obj.digest()
+            # Convert to list of floats
+            embedding = [float(b) / 255.0 for b in hash_bytes] * 60  # Repeat to get 1536 dimensions
+            return embedding[:1536]
+        
+        try:
+            response = openai_client.embeddings.create(
+                input=text,
+                model="text-embedding-ada-002"
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            print(f"Error getting embedding: {e}")
+            # Return a dummy embedding if OpenAI fails
+            return [0.0] * 1536
+    
+    def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
+        """Calculate cosine similarity between two vectors"""
+        if len(vec1) != len(vec2):
+            return 0.0
+        
+        dot_product = sum(a * b for a, b in zip(vec1, vec2))
+        norm1 = sum(a * a for a in vec1) ** 0.5
+        norm2 = sum(b * b for b in vec2) ** 0.5
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        return dot_product / (norm1 * norm2)
+
+# Initialize vector database
+vector_db = VectorDatabase()
+
+def save_image_to_shared_volume(image_data: str, user_id: str, image_type: str) -> Optional[str]:
+    """Save base64 image to shared volume and return file path"""
+    try:
+        # Decode base64 image
+        image_bytes = base64.b64decode(image_data)
+        
+        # Create user-specific folder
+        user_images_folder = os.path.join(IMAGES_FOLDER, user_id)
+        os.makedirs(user_images_folder, exist_ok=True)
+        
+        # Generate unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{image_type}_{timestamp}_{uuid.uuid4().hex[:8]}.png"
+        file_path = os.path.join(user_images_folder, filename)
+        
+        # Save image
+        with open(file_path, 'wb') as f:
+            f.write(image_bytes)
+        
+        return file_path
+    except Exception as e:
+        print(f"Error saving image: {e}")
+        return None
+
+def create_analysis_context(results: Dict[str, Any], user_id: str) -> List[str]:
+    """Create context documents from analysis results for vector database"""
+    context_docs = []
+    
+    # Model information
+    if 'model_info' in results:
+        model_info = results['model_info']
+        model_doc = f"Model Type: {model_info.get('model_type', 'Unknown')}. "
+        if 'feature_names' in model_info:
+            features = ', '.join(model_info['feature_names'])
+            model_doc += f"Features: {features}. "
+        if 'analyzed_at' in model_info:
+            model_doc += f"Analyzed at: {model_info['analyzed_at']}."
+        
+        context_docs.append(model_doc)
+    
+    # Performance metrics
+    if 'performance_metrics' in results:
+        metrics = results['performance_metrics']
+        metrics_doc = "Performance Metrics: "
+        for key, value in metrics.items():
+            metrics_doc += f"{key}: {value}, "
+        context_docs.append(metrics_doc.rstrip(', '))
+    
+    # Data summary
+    if 'data_summary' in results:
+        data_summary = results['data_summary']
+        data_doc = f"Dataset: Shape {data_summary.get('shape', 'Unknown')}. "
+        if 'columns' in data_summary:
+            columns = ', '.join(data_summary['columns'])
+            data_doc += f"Columns: {columns}."
+        context_docs.append(data_doc)
+    
+    # Feature importance
+    if 'feature_importance' in results:
+        importance = results['feature_importance']
+        if isinstance(importance, dict):
+            importance_doc = "Feature Importance: "
+            for feature, score in importance.items():
+                importance_doc += f"{feature}: {score}, "
+            context_docs.append(importance_doc.rstrip(', '))
+    
+    # LIME Analysis Information
+    lime_doc = "LIME Analysis: The analysis includes LIME (Local Interpretable Model-agnostic Explanations) visualizations that show local feature importance for individual predictions. LIME helps understand which words or features are most important for specific sentiment predictions."
+    context_docs.append(lime_doc)
+    
+    # Visualization Summary
+    if 'images' in results:
+        viz_count = len(results['images'])
+        viz_doc = f"Visualizations: The analysis generated {viz_count} comprehensive visualizations including LIME explanations, attention analysis plots, feature importance charts, correlation heatmaps, performance metrics, and detailed model explanations."
+        context_docs.append(viz_doc)
+        
+        # Add specific visualization types
+        viz_types = []
+        if viz_count >= 6:  # Time series models
+            viz_types.extend([
+                "Enhanced Feature Importance Plot with color-coded bars and value labels",
+                "Time Series Predictions with Confidence Intervals",
+                "Feature Correlation Matrix with masked upper triangle",
+                "Feature Distribution Analysis with 6-panel plots",
+                "Model Performance Metrics visualization",
+                "Time Series Decomposition (trend, seasonality, residuals)",
+                "SHAP Summary Plot showing feature contributions",
+                "SHAP Dependence Plots for top features",
+                "SHAP Force Plots for sample predictions",
+                "SHAP Waterfall Plot for individual predictions"
+            ])
+        elif viz_count >= 7:  # Text/sentiment models
+            viz_types.extend([
+                "Enhanced Word Importance Plot with top 25 words",
+                "Multi-Class Sentiment Distributions",
+                "Classification Performance Metrics",
+                "Word Frequency Analysis",
+                "Sentiment Trend Analysis",
+                "Confusion Matrix visualization",
+                "Word Cloud Analysis",
+                "LIME Explanation for individual predictions",
+                "Attention Analysis for transformer models",
+                "Word Sentiment Association plots",
+                "Feature Importance charts",
+                "Model Performance visualizations"
+            ])
+        
+        if viz_types:
+            viz_details = "Detailed Visualizations: " + ". ".join(viz_types) + "."
+            context_docs.append(viz_details)
+    
+    # LIME analysis summary
+    if 'lime_analysis' in results and results['lime_analysis']:
+        lime_analysis = results['lime_analysis']
+        if 'top_features' in lime_analysis and lime_analysis['top_features']:
+            top_feats = lime_analysis['top_features']
+            lime_doc = "Top LIME Features: " + ", ".join([f"{f['feature']} (importance={f['importance']:.4f})" for f in top_feats])
+            context_docs.append(lime_doc)
+            
+            # Add detailed LIME analysis
+            lime_details = f"LIME Analysis Details: Analyzed {lime_analysis.get('total_features_analyzed', 0)} features for local explanations. "
+            lime_details += f"Top feature '{top_feats[0]['feature']}' has the highest importance ({top_feats[0]['importance']:.4f}), indicating it has the strongest influence on this specific prediction."
+            context_docs.append(lime_details)
+        elif 'error' in lime_analysis:
+            lime_doc = f"LIME Analysis Error: {lime_analysis['error']}"
+            context_docs.append(lime_doc)
+    
+    # Visualization descriptions
+    if 'images' in results:
+        viz_descriptions = [
+            "Feature Importance Analysis: Shows which variables have the most impact on model predictions",
+            "SHAP Summary Plot: Displays how each feature contributes to individual predictions",
+            "Feature Correlation Heatmap: Shows relationships between different features",
+            "Feature Distributions: Displays the spread and shape of feature values",
+            "Model Performance Analysis: Shows accuracy, precision, recall, and other metrics",
+            "Model Explainability Summary: Provides overall insights into model behavior"
+        ]
+        
+        for i, description in enumerate(viz_descriptions):
+            if i < len(results['images']):
+                context_docs.append(description)
+    
+    return context_docs
+
+def save_results_to_shared_volume(results: Dict[str, Any], user_id: str) -> Optional[str]:
+    """Save analysis results as JSON file to shared volume"""
+    try:
+        # Create user-specific results folder
+        user_results_folder = os.path.join(RESULTS_FOLDER, user_id)
+        os.makedirs(user_results_folder, exist_ok=True)
+        
+        # Generate unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"analysis_results_{timestamp}.json"
+        file_path = os.path.join(user_results_folder, filename)
+        
+        # Save results as JSON
+        with open(file_path, 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        
+        print(f"Saved results to {file_path}")
+        return file_path
+    except Exception as e:
+        print(f"Error saving results to shared volume: {e}")
+        return None
+
+def store_results_in_vector_db(results: Dict[str, Any], user_id: str):
+    """Store analysis results in vector database"""
+    try:
+        # Save results to shared volume first
+        save_results_to_shared_volume(results, user_id)
+
+        def store_plot_summary(summary: Dict[str, Any], source: str):
+            title = summary.get('title', 'Plot Summary')
+            plot_type = summary.get('plot_type', summary.get('type', 'unknown'))
+            description = summary.get('description', '')
+            data = summary.get('data', {})
+            metadata = summary.get('metadata', {})
+            summary_text = summary.get('summary_text', '')
+
+            doc = f"{title}. Plot type: {plot_type}. "
+            if description:
+                doc += f"Description: {description}. "
+            if summary_text:
+                doc += f"Summary: {summary_text}. "
+            if data:
+                doc += f"Data: {json.dumps(data, default=str)}. "
+            if metadata:
+                doc += f"Metadata: {json.dumps(metadata, default=str)}."
+
+            vector_db.add_document(
+                user_id,
+                doc,
+                {
+                    'doc_type': 'plot_summary',
+                    'plot_type': plot_type,
+                    'source': source,
+                    'title': title,
+                    'description': description,
+                    'data': data,
+                    'summary_text': summary_text,
+                    'metadata': metadata,
+                    'timestamp': datetime.now().isoformat()
+                }
+            )
+        
+        # Handle different types of results
+        result_type = results.get('type', 'unknown')
+
+        if 'plot_summaries' in results and isinstance(results['plot_summaries'], list):
+            for summary in results['plot_summaries']:
+                if isinstance(summary, dict):
+                    store_plot_summary(summary, source='results_plot_summaries')
+        
+        # Check for data_statistics in the new format
+        if 'data_statistics' in results:
+            data_stats = results['data_statistics']
+            data_type = data_stats.get('data_type', 'unknown')
+            visualizations = data_stats.get('visualizations', [])
+            
+            data_doc = f"Data Statistics Analysis: Data type: {data_type}. "
+            data_doc += "Analysis includes: comprehensive data overview, sentiment distribution histogram, per-asset sentiment boxplots, keyword frequency analysis, word sentiment associations, asset distribution charts, and text length distribution. "
+            data_doc += "Data Overview: Shows dataset statistics including total articles, average title length, date range, distinct assets, and column information. "
+            data_doc += "Sentiment Distribution: Histogram showing the distribution of sentiment scores across all articles with neutral (0) as reference point. "
+            data_doc += "Per-Asset Sentiment: Boxplot analysis showing sentiment patterns for the top 25 assets by article count. "
+            data_doc += "Keyword Insights: Horizontal bar chart showing the top 15 most frequent words in article titles. "
+            data_doc += "Word Sentiment Associations: Two-panel chart showing top 10 words driving positive sentiment (green bars) and negative sentiment (red bars) with exact scores. "
+            data_doc += "Asset Distribution: Horizontal bar chart showing the top 20 assets by article count. "
+            data_doc += "Text Length Distribution: Histogram showing the distribution of article title lengths with mean, median, and standard deviation markers. "
+            data_doc += f" Visualizations generated: {', '.join(visualizations)}."
+            
+            # Add actual plot data to the document
+            plot_data = data_stats.get('plot_data', {})
+            import sys
+            sys.stdout.write(f"DEBUG: Received plot_data keys: {list(plot_data.keys())}\n")
+            sys.stdout.flush()
+            if 'word_sentiment' in plot_data:
+                sys.stdout.write(f"DEBUG: Found word_sentiment in plot_data, storing plot summary\n")
+                sys.stdout.flush()
+                word_sentiment = plot_data['word_sentiment']
+                sys.stdout.write(f"DEBUG: word_sentiment has positive_words: {bool(word_sentiment.get('positive_words'))}, negative_words: {bool(word_sentiment.get('negative_words'))}\n")
+                sys.stdout.flush()
+                word_sentiment = plot_data['word_sentiment']
+                pos_words = word_sentiment.get('positive_words', [])
+                neg_words = word_sentiment.get('negative_words', [])
+                
+                if pos_words:
+                    data_doc += f" Top 10 positive words: {', '.join([f'{word}({score:.2f})' for word, score in pos_words[:5]])}. "
+                if neg_words:
+                    data_doc += f" Top 10 negative words: {', '.join([f'{word}({score:.2f})' for word, score in neg_words[:5]])}. "
+                store_plot_summary(
+                    {
+                        'title': 'Word Sentiment Associations',
+                        'plot_type': 'word_sentiment_association',
+                        'description': 'Top words driving positive and negative sentiment.',
+                        'data': word_sentiment,
+                        'summary_text': 'Top positive and negative sentiment-associated words.'
+                    },
+                    source='data_statistics_plot_data'
+                )
+            
+            if 'keywords' in plot_data:
+                keywords = plot_data['keywords'].get('top_keywords', [])
+                if keywords:
+                    data_doc += f" Top 15 keywords: {', '.join([f'{word}({count})' for word, count in keywords[:5]])}. "
+                store_plot_summary(
+                    {
+                        'title': 'Top Keywords',
+                        'plot_type': 'keyword_frequency',
+                        'description': 'Most frequent words in titles.',
+                        'data': plot_data.get('keywords', {}),
+                        'summary_text': 'Most frequent keywords in the dataset.'
+                    },
+                    source='data_statistics_plot_data'
+                )
+            
+            # Also store plot_summaries if they're included directly in data_statistics
+            if 'plot_summaries' in data_stats and isinstance(data_stats['plot_summaries'], list):
+                for summary in data_stats['plot_summaries']:
+                    if isinstance(summary, dict):
+                        store_plot_summary(summary, source='data_statistics_plot_summaries')
+            
+            metadata = {
+                'user_id': user_id,
+                'doc_type': 'data_statistics',
+                'data_type': data_type,
+                'visualizations': visualizations,
+                'timestamp': data_stats.get('timestamp', datetime.now().isoformat())
+            }
+            vector_db.add_document(user_id, data_doc, metadata)
+            
+            # Store images and their metadata
+            if 'images' in results:
+                for i, image_data in enumerate(results['images']):
+                    image_type = f"data_stats_{i+1}"
+                    
+                    # Handle both base64 and file path formats
+                    if isinstance(image_data, dict) and 'image' in image_data:
+                        # Base64 image data
+                        base64_data = image_data['image']
+                        image_path = save_image_to_shared_volume(base64_data, user_id, image_type)
+                        
+                        if image_path:
+                            # Create image metadata document
+                            image_doc = f"Data Statistics Visualization {i+1}: {image_type} stored at {image_path}"
+                            metadata = {
+                                'user_id': user_id,
+                                'doc_type': 'data_statistics_visualization',
+                                'image_path': image_path,
+                                'image_type': image_type,
+                                'index': i
+                            }
+                            vector_db.add_document(user_id, image_doc, metadata)
+                        if isinstance(image_data, dict) and image_data.get('summary'):
+                            summary_payload = {
+                                'title': image_data.get('title', f"Data Statistics Visualization {i+1}"),
+                                'plot_type': image_data.get('type', image_type),
+                                'description': image_data.get('description', ''),
+                                'data': image_data.get('data', {}),
+                                'metadata': image_data.get('metadata', {}),
+                                'summary_text': image_data.get('summary')
+                            }
+                            store_plot_summary(summary_payload, source='data_statistics_images')
+                        if isinstance(image_data, dict) and image_data.get('summary'):
+                            summary_payload = {
+                                'title': image_data.get('title', f"Data Statistics Visualization {i+1}"),
+                                'plot_type': image_data.get('type', image_type),
+                                'description': image_data.get('description', ''),
+                                'data': image_data.get('data', {}),
+                                'metadata': image_data.get('metadata', {}),
+                                'summary_text': image_data.get('summary')
+                            }
+                            store_plot_summary(summary_payload, source='data_statistics_images')
+                    elif isinstance(image_data, str):
+                        # Direct base64 string
+                        image_path = save_image_to_shared_volume(image_data, user_id, image_type)
+                        
+                        if image_path:
+                            # Create image metadata document
+                            image_doc = f"Data Statistics Visualization {i+1}: {image_type} stored at {image_path}"
+                            metadata = {
+                                'user_id': user_id,
+                                'doc_type': 'data_statistics_visualization',
+                                'image_path': image_path,
+                                'image_type': image_type,
+                                'index': i
+                            }
+                            vector_db.add_document(user_id, image_doc, metadata)
+                        if isinstance(image_data, dict) and image_data.get('summary'):
+                            summary_payload = {
+                                'title': image_data.get('title', f"Data Statistics Visualization {i+1}"),
+                                'plot_type': image_data.get('type', image_type),
+                                'description': image_data.get('description', ''),
+                                'data': image_data.get('data', {}),
+                                'metadata': image_data.get('metadata', {}),
+                                'summary_text': image_data.get('summary')
+                            }
+                            store_plot_summary(summary_payload, source='data_statistics_images')
+                        if isinstance(image_data, dict) and image_data.get('summary'):
+                            summary_payload = {
+                                'title': image_data.get('title', f"Data Statistics Visualization {i+1}"),
+                                'plot_type': image_data.get('type', image_type),
+                                'description': image_data.get('description', ''),
+                                'data': image_data.get('data', {}),
+                                'metadata': image_data.get('metadata', {}),
+                                'summary_text': image_data.get('summary')
+                            }
+                            store_plot_summary(summary_payload, source='data_statistics_images')
+        
+        elif result_type == 'data_statistics':
+            # Store data statistics results
+            data_doc = f"Data Statistics Analysis: Data type: {results.get('data_type', 'unknown')}. "
+            data_doc += "Analysis includes: word sentiment associations, keyword insights, sentiment distribution, per-asset sentiment analysis, and comprehensive data overview. "
+            data_doc += "Word sentiment analysis shows the top 10 words driving positive and negative sentiment in the dataset. "
+            data_doc += "Keyword insights show the most frequent words in article titles. "
+            data_doc += "Asset-specific analysis shows sentiment patterns by financial asset/ticker."
+            
+            metadata = {
+                'user_id': user_id,
+                'doc_type': 'data_statistics',
+                'data_type': results.get('data_type', 'unknown'),
+                'insights': results.get('insights', {}),
+                'timestamp': results.get('timestamp', datetime.now().isoformat())
+            }
+            vector_db.add_document(user_id, data_doc, metadata)
+
+            plot_data = results.get('plot_data', {})
+            if 'word_sentiment' in plot_data:
+                store_plot_summary(
+                    {
+                        'title': 'Word Sentiment Associations',
+                        'plot_type': 'word_sentiment_association',
+                        'description': 'Top words driving positive and negative sentiment.',
+                        'data': plot_data.get('word_sentiment', {}),
+                        'summary_text': 'Top positive and negative sentiment-associated words.'
+                    },
+                    source='data_statistics_plot_data'
+                )
+            if 'keywords' in plot_data:
+                store_plot_summary(
+                    {
+                        'title': 'Top Keywords',
+                        'plot_type': 'keyword_frequency',
+                        'description': 'Most frequent words in titles.',
+                        'data': plot_data.get('keywords', {}),
+                        'summary_text': 'Most frequent keywords in the dataset.'
+                    },
+                    source='data_statistics_plot_data'
+                )
+            
+            # Store images and their metadata
+            if 'images' in results:
+                for i, image_data in enumerate(results['images']):
+                    image_type = f"data_stats_{i+1}"
+                    
+                    # Handle both base64 and file path formats
+                    if isinstance(image_data, dict) and 'image' in image_data:
+                        # Base64 image data
+                        base64_data = image_data['image']
+                        image_path = save_image_to_shared_volume(base64_data, user_id, image_type)
+                        
+                        if image_path:
+                            # Create image metadata document
+                            image_doc = f"Data Statistics Visualization {i+1}: {image_type} stored at {image_path}"
+                            metadata = {
+                                'user_id': user_id,
+                                'doc_type': 'data_statistics_visualization',
+                                'image_path': image_path,
+                                'image_type': image_type,
+                                'index': i
+                            }
+                            vector_db.add_document(user_id, image_doc, metadata)
+                    elif isinstance(image_data, str):
+                        # Direct base64 string
+                        image_path = save_image_to_shared_volume(image_data, user_id, image_type)
+                        
+                        if image_path:
+                            # Create image metadata document
+                            image_doc = f"Data Statistics Visualization {i+1}: {image_type} stored at {image_path}"
+                            metadata = {
+                                'user_id': user_id,
+                                'doc_type': 'data_statistics_visualization',
+                                'image_path': image_path,
+                                'image_type': image_type,
+                                'index': i
+                            }
+                            vector_db.add_document(user_id, image_doc, metadata)
+        
+        elif result_type == 'xai_analysis':
+            # Clear previous XAI results for this user
+            if user_id in vector_db.collections:
+                # Remove old XAI-related documents
+                old_docs = []
+                old_embeddings = []
+                old_metadata = []
+                
+                for i, metadata_doc in enumerate(vector_db.collections[user_id]['metadata']):
+                    if metadata_doc.get('doc_type') in ['xai_analysis', 'xai_visualization']:
+                        # Skip this document (don't add to new lists)
+                        continue
+                    else:
+                        # Keep this document
+                        old_docs.append(vector_db.collections[user_id]['documents'][i])
+                        old_embeddings.append(vector_db.collections[user_id]['embeddings'][i])
+                        old_metadata.append(metadata_doc)
+                
+                # Replace the collection with only non-XAI documents
+                vector_db.collections[user_id]['documents'] = old_docs
+                vector_db.collections[user_id]['embeddings'] = old_embeddings
+                vector_db.collections[user_id]['metadata'] = old_metadata
+            
+            # Store new XAI analysis results
+            xai_data = results.get('visualizations', {})
+            example_index = results.get('example_index', 'N/A')
+            model_type = results.get('model_type', 'N/A')
+            
+            xai_doc = f"XAI Analysis Results: Example index: {example_index}. "
+            xai_doc += f"Model type: {model_type}. "
+            xai_doc += f"Visualizations generated: {', '.join(xai_data.keys()) if isinstance(xai_data, dict) else 'multiple visualizations'}. "
+            
+            # Add specific descriptions for each visualization type
+            if 'lime' in xai_data and xai_data['lime']:
+                xai_doc += "LIME Analysis: Local Interpretable Model-agnostic Explanations showing which words are most important for the specific sentiment prediction. "
+                xai_doc += "LIME highlights the top contributing words that drive the model's decision for this particular text example. "
+            
+            if 'attention' in xai_data and xai_data['attention']:
+                xai_doc += "Attention Analysis: Shows attention weights from the transformer model, highlighting which words the model focuses on when making predictions. "
+            
+            if 'confidence' in xai_data and xai_data['confidence']:
+                xai_doc += "Prediction Confidence: Visualizes the confidence levels of the model's predictions across different sentiment categories. "
+            
+            metadata = {
+                'user_id': user_id,
+                'doc_type': 'xai_analysis',
+                'example_index': example_index,
+                'model_type': model_type,
+                'visualizations': list(xai_data.keys()) if isinstance(xai_data, dict) else [],
+                'timestamp': results.get('timestamp', datetime.now().isoformat())
+            }
+            vector_db.add_document(user_id, xai_doc, metadata)
+            
+            # Store XAI visualizations
+            if isinstance(xai_data, dict):
+                for viz_type, viz_data in xai_data.items():
+                    if isinstance(viz_data, str):  # Base64 image
+                        image_path = save_image_to_shared_volume(viz_data, user_id, f"xai_{viz_type}")
+                        if image_path:
+                            viz_doc = f"XAI Visualization: {viz_type} stored at {image_path}"
+                            metadata = {
+                                'user_id': user_id,
+                                'doc_type': 'xai_visualization',
+                                'visualization_type': viz_type,
+                                'image_path': image_path,
+                                'example_index': example_index
+                            }
+                            vector_db.add_document(user_id, viz_doc, metadata)
+                    if isinstance(viz_data, dict) and viz_data.get('summary'):
+                        summary_payload = {
+                            'title': viz_data.get('title', f"XAI Visualization {viz_type}"),
+                            'plot_type': viz_type,
+                            'description': viz_data.get('description', ''),
+                            'data': viz_data.get('data', {}),
+                            'metadata': viz_data.get('metadata', {}),
+                            'summary_text': viz_data.get('summary')
+                        }
+                        store_plot_summary(summary_payload, source='xai_visualizations')
+        
+        else:
+            # Handle legacy results format
+            # Create context documents
+            context_docs = create_analysis_context(results, user_id)
+            
+            # Store each document in vector database
+            for i, doc in enumerate(context_docs):
+                metadata = {
+                    'user_id': user_id,
+                    'doc_type': 'analysis_context',
+                    'index': i,
+                    'timestamp': datetime.now().isoformat()
+                }
+                vector_db.add_document(user_id, doc, metadata)
+            
+            # Store images and their metadata
+            if 'images' in results:
+                for i, image_data in enumerate(results['images']):
+                    image_type = f"viz_{i+1}"
+                    image_path = save_image_to_shared_volume(image_data, user_id, image_type)
+                    
+                    if image_path:
+                        # Create image metadata document
+                        image_doc = f"Visualization {i+1}: {image_type} stored at {image_path}"
+                        metadata = {
+                            'user_id': user_id,
+                            'doc_type': 'visualization',
+                            'image_path': image_path,
+                            'image_type': image_type,
+                            'index': i
+                        }
+                        vector_db.add_document(user_id, image_doc, metadata)
+                    if isinstance(image_data, dict) and image_data.get('summary'):
+                        summary_payload = {
+                            'title': image_data.get('title', f"Visualization {i+1}"),
+                            'plot_type': image_data.get('type', image_type),
+                            'description': image_data.get('description', ''),
+                            'data': image_data.get('data', {}),
+                            'metadata': image_data.get('metadata', {}),
+                            'summary_text': image_data.get('summary')
+                        }
+                        store_plot_summary(summary_payload, source='results_images')
+        
+        print(f"Stored results in vector database for user {user_id}, type: {result_type}")
+        
+    except Exception as e:
+        print(f"Error storing results in vector database: {e}")
+
+def add_to_conversation_history(user_id: str, question: str, answer: str):
+    """Add a question-answer pair to user's conversation history"""
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+    
+    conversation_history[user_id].append({
+        'question': question,
+        'answer': answer,
+        'timestamp': datetime.now().isoformat()
+    })
+    
+    # Keep only last 10 exchanges to prevent context from getting too long
+    if len(conversation_history[user_id]) > 10:
+        conversation_history[user_id] = conversation_history[user_id][-10:]
+
+def get_conversation_context(user_id: str) -> str:
+    """Get recent conversation context for a user"""
+    if user_id not in conversation_history or not conversation_history[user_id]:
+        return ""
+    
+    context_parts = []
+    for exchange in conversation_history[user_id][-5:]:  # Last 5 exchanges
+        context_parts.append(f"Previous Q: {exchange['question']}")
+        context_parts.append(f"Previous A: {exchange['answer']}")
+    
+    return "\n".join(context_parts)
+
+def clear_conversation_history(user_id: str):
+    """Clear conversation history for a user"""
+    if user_id in conversation_history:
+        del conversation_history[user_id]
+
+def format_context_for_llm(relevant_docs: List[Dict[str, Any]], plot_summaries: List[Dict[str, Any]]) -> str:
+    """Format context in a way that's easier for LLM to parse and use"""
+    context_parts = []
+    
+    # Extract plot summaries with structured data
+    if plot_summaries:
+        context_parts.append("=== PLOT SUMMARIES AND DATA ===\n")
+        for summary in plot_summaries:
+            plot_type = summary.get('plot_type', 'unknown')
+            title = summary.get('title', 'Untitled Plot')
+            description = summary.get('description', '')
+            data = summary.get('data', {})
+            
+            context_parts.append(f"\nPlot: {title} (Type: {plot_type})")
+            context_parts.append(f"Description: {description}")
+            
+            # Format structured data clearly
+            if isinstance(data, dict):
+                if 'positive_words' in data:
+                    pos_words = data['positive_words']
+                    if pos_words:
+                        context_parts.append(f"\nPositive Words (with sentiment scores):")
+                        for word, score in pos_words[:15]:  # Show top 15
+                            # Check if score is a sentiment score (typically -1 to 1) or a count
+                            if isinstance(score, (int, float)):
+                                if abs(score) > 10:
+                                    context_parts.append(f"  - {word}: {int(score)} occurrences")
+                                else:
+                                    context_parts.append(f"  - {word}: {score:.3f} sentiment score")
+                            else:
+                                context_parts.append(f"  - {word}: {score}")
+                
+                if 'negative_words' in data:
+                    neg_words = data['negative_words']
+                    if neg_words:
+                        context_parts.append(f"\nNegative Words (with sentiment scores):")
+                        for word, score in neg_words[:15]:
+                            if isinstance(score, (int, float)):
+                                if abs(score) > 10:
+                                    context_parts.append(f"  - {word}: {int(score)} occurrences")
+                                else:
+                                    context_parts.append(f"  - {word}: {score:.3f} sentiment score")
+                            else:
+                                context_parts.append(f"  - {word}: {score}")
+                
+                if 'top_keywords' in data:
+                    keywords = data['top_keywords']
+                    if keywords:
+                        context_parts.append(f"\nTop Keywords (with frequencies):")
+                        for keyword, freq in keywords[:15]:
+                            context_parts.append(f"  - {keyword}: {freq} occurrences")
+                
+                # Handle image analysis data
+                if 'class_distribution' in data:
+                    class_dist = data['class_distribution']
+                    if isinstance(class_dist, dict):
+                        context_parts.append(f"\nClass Distribution:")
+                        for class_name, count in list(class_dist.items())[:15]:
+                            context_parts.append(f"  - {class_name}: {count} samples")
+                
+                if 'confusion_matrix' in data:
+                    context_parts.append(f"\nConfusion Matrix: Available in plot visualization")
+            
+            context_parts.append("\n")
+    
+    # Add other relevant documents (excluding plot summaries already included)
+    if relevant_docs:
+        context_parts.append("\n=== ADDITIONAL ANALYSIS CONTEXT ===\n")
+        for doc in relevant_docs:
+            if doc.get('metadata', {}).get('doc_type') != 'plot_summary':  # Skip if already in plot summaries
+                context_parts.append(doc['text'])
+                context_parts.append("\n")
+    
+    return "\n".join(context_parts)
+
+def generate_structured_fallback_response(question: str, relevant_docs: List[Dict[str, Any]], 
+                                         plot_summaries: List[Dict[str, Any]], 
+                                         conversation_context: str = "") -> str:
+    """Generate structured response when LLM is unavailable"""
+    question_lower = question.lower()
+    
+    # Check for open-ended questions
+    is_open_ended = any(phrase in question_lower for phrase in [
+        "what can you tell me", "tell me about", "what do you see", 
+        "summarize", "overview", "what's in", "describe", "what are"
+    ])
+    
+    # Check for follow-up questions
+    is_followup = any(phrase in question_lower for phrase in [
+        "the negative ones", "the positive ones", "negative ones", "positive ones",
+        "what about", "and the"
+    ])
+    
+    # Extract information from context
+    model_info = ""
+    features = ""
+    performance = ""
+    data_info = ""
+    
+    for doc in relevant_docs:
+        doc_text = doc['text'].lower()
+        if "model type:" in doc_text or "model:" in doc_text:
+            model_info = doc['text']
+        elif "features:" in doc_text:
+            features = doc['text']
+        elif "performance metrics:" in doc_text or "performance:" in doc_text:
+            performance = doc['text']
+        elif "dataset:" in doc_text or "shape" in doc_text:
+            data_info = doc['text']
+    
+    # Handle open-ended questions
+    if is_open_ended:
+        response_parts = ["Based on your analysis, here's what I can see:\n"]
+        
+        # Dataset info
+        if data_info:
+            response_parts.append(f"**Dataset:** {data_info}\n")
+        
+        # Model info
+        if model_info:
+            response_parts.append(f"**Model:** {model_info}\n")
+        
+        # Plot summaries
+        if plot_summaries:
+            response_parts.append("\n**Visualizations and Analysis:**\n")
+            for summary in plot_summaries:
+                plot_type = summary.get('plot_type', '')
+                title = summary.get('title', '')
+                description = summary.get('description', '')
+                data = summary.get('data', {})
+                
+                response_parts.append(f"- **{title}** ({plot_type}): {description}")
+                
+                # Add specific data
+                if isinstance(data, dict):
+                    if 'positive_words' in data and data['positive_words']:
+                        top_pos = data['positive_words'][:5]
+                        pos_list = ", ".join([f"{w}" for w, s in top_pos])
+                        response_parts.append(f"  Top positive words: {pos_list}")
+                    
+                    if 'negative_words' in data and data['negative_words']:
+                        top_neg = data['negative_words'][:5]
+                        neg_list = ", ".join([f"{w}" for w, s in top_neg])
+                        response_parts.append(f"  Top negative words: {neg_list}")
+                    
+                    if 'top_keywords' in data and data['top_keywords']:
+                        top_keywords = data['top_keywords'][:5]
+                        keywords_list = ", ".join([f"{k}" for k, f in top_keywords])
+                        response_parts.append(f"  Top keywords: {keywords_list}")
+        
+        return "\n".join(response_parts)
+    
+    # Handle follow-up questions about negative/positive words
+    if is_followup and conversation_context:
+        # Try to extract context from previous conversation
+        if "positive" in conversation_context.lower():
+            # User is asking about negative words after positive
+            for summary in plot_summaries:
+                data = summary.get('data', {})
+                neg = data.get('negative_words', [])
+                if neg:
+                    neg_list = ", ".join([f"{w}" for w, s in neg[:10]])
+                    return f"**Top Negative Words:** {neg_list}"
+        elif "negative" in conversation_context.lower():
+            # User is asking about positive words after negative
+            for summary in plot_summaries:
+                data = summary.get('data', {})
+                pos = data.get('positive_words', [])
+                if pos:
+                    pos_list = ", ".join([f"{w}" for w, s in pos[:10]])
+                    return f"**Top Positive Words:** {pos_list}"
+    
+    # Handle specific question patterns
+    if any(keyword in question_lower for keyword in ["positive word", "negative word", "sentiment word", "most positive", "most negative", "main positive", "main negative"]):
+        # Use existing word sentiment logic from the main function
+        for summary in plot_summaries:
+            data = summary.get('data', {})
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except:
+                    data = {}
+            pos = data.get('positive_words') or data.get('top_positive') or []
+            neg = data.get('negative_words') or data.get('top_negative') or []
+            
+            if pos or neg:
+                if pos and isinstance(pos[0], (list, tuple)) and len(pos[0]) == 2:
+                    pos_list = ", ".join([f"{w}" for w, s in pos[:10]])
+                else:
+                    pos_list = ", ".join([str(w) for w in pos[:10]]) if pos else "not available"
+                
+                if neg and isinstance(neg[0], (list, tuple)) and len(neg[0]) == 2:
+                    neg_list = ", ".join([f"{w}" for w, s in neg[:10]])
+                else:
+                    neg_list = ", ".join([str(w) for w in neg[:10]]) if neg else "not available"
+                
+                response_text = "Based on the word sentiment analysis:\n\n"
+                if "positive" in question_lower or "most positive" in question_lower:
+                    response_text += f"**Top Positive Words:** {pos_list}\n\n"
+                if "negative" in question_lower or "most negative" in question_lower:
+                    response_text += f"**Top Negative Words:** {neg_list}\n\n"
+                if "positive" not in question_lower and "negative" not in question_lower:
+                    response_text += f"**Top Positive Words:** {pos_list}\n\n"
+                    response_text += f"**Top Negative Words:** {neg_list}"
+                
+                return response_text
+    
+    # Default fallback
+    if plot_summaries:
+        return f"I can see you have {len(plot_summaries)} plot(s) available. Please ask specific questions about your data, model, or visualizations."
+    else:
+        return "I can see you have analysis results available. Please ask specific questions about your model type, features, performance, or visualizations."
+
+def generate_rag_response(question: str, user_id: str) -> str:
+    """Generate response using RAG approach"""
+    try:
+        # Search for relevant context
+        relevant_docs = vector_db.search(user_id, question, top_k=8)  # Increased for richer context
+        
+        print(f"DEBUG: Found {len(relevant_docs)} relevant documents for question: '{question}'")
+        for i, doc in enumerate(relevant_docs):
+            print(f"DEBUG: Doc {i+1}: {doc['text'][:100]}... (similarity: {doc['similarity']:.3f})")
+        
+        if not relevant_docs:
+            return "I don't have access to your analysis results yet. Please upload and analyze a model first."
+        
+        # Extract plot summaries from relevant documents
+        def extract_plot_summary_data(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            import sys
+            summaries = []
+            for doc in docs:
+                if doc.get('metadata', {}).get('doc_type') != 'plot_summary':
+                    continue
+                meta = doc.get('metadata', {})
+                plot_type = meta.get('plot_type', '')
+                data = meta.get('data')
+                sys.stdout.write(f"DEBUG extract: plot_type={plot_type}, data_type={type(data)}, data_keys={list(data.keys()) if isinstance(data, dict) else 'not_dict'}\n")
+                sys.stdout.flush()
+                if not data and isinstance(doc.get('text'), str):
+                    # Try to parse data from the text payload: "Data: {...}."
+                    text = doc['text']
+                    marker = "Data: "
+                    if marker in text:
+                        try:
+                            data_str = text.split(marker, 1)[1]
+                            if "Metadata:" in data_str:
+                                data_str = data_str.split("Metadata:", 1)[0]
+                            data_str = data_str.strip().rstrip(". ")
+                            data = json.loads(data_str)
+                            sys.stdout.write(f"DEBUG extract: Parsed data from text, keys={list(data.keys()) if isinstance(data, dict) else 'not_dict'}\n")
+                            sys.stdout.flush()
+                        except Exception as e:
+                            sys.stdout.write(f"DEBUG extract: Failed to parse data from text: {e}\n")
+                            sys.stdout.flush()
+                            data = None
+                summary_data = data or {}
+                sys.stdout.write(f"DEBUG extract: Final summary_data keys={list(summary_data.keys()) if isinstance(summary_data, dict) else 'not_dict'}, has_pos={bool(summary_data.get('positive_words') if isinstance(summary_data, dict) else False)}, has_neg={bool(summary_data.get('negative_words') if isinstance(summary_data, dict) else False)}\n")
+                sys.stdout.flush()
+                summaries.append({
+                    'title': meta.get('title', ''),
+                    'plot_type': plot_type,
+                    'data': summary_data,
+                    'description': meta.get('description', ''),
+                    'summary_text': meta.get('summary_text', '')
+                })
+            return summaries
+        
+        plot_summaries = extract_plot_summary_data(relevant_docs)
+        
+        # Also search all documents for plot summaries if question is about plots/visualizations
+        question_lower = question.lower()
+        if any(keyword in question_lower for keyword in ["plot", "chart", "visualization", "graph", "word", "sentiment", "positive", "negative", "image", "class"]):
+            if user_id in vector_db.collections:
+                all_docs = []
+                for text, meta in zip(vector_db.collections[user_id]['documents'], 
+                                    vector_db.collections[user_id]['metadata']):
+                    all_docs.append({'text': text, 'metadata': meta})
+                all_plot_summaries = extract_plot_summary_data(all_docs)
+                # Merge unique plot summaries
+                existing_types = {s.get('plot_type') for s in plot_summaries}
+                for s in all_plot_summaries:
+                    if s.get('plot_type') not in existing_types:
+                        plot_summaries.append(s)
+        
+        # Format context using the new formatting function
+        formatted_context = format_context_for_llm(relevant_docs, plot_summaries)
+        
+        # Get conversation history
+        conversation_context = get_conversation_context(user_id)
+        
+        print(f"DEBUG: Context length: {len(formatted_context)} characters")
+        print(f"DEBUG: Context preview: {formatted_context[:200]}...")
+        print(f"DEBUG: Conversation context length: {len(conversation_context)} characters")
+        print(f"DEBUG: Found {len(plot_summaries)} plot summaries")
+        
+        # Create system prompt
+        system_prompt = """You are an AI assistant specialized in Explainable AI (XAI) and data analysis. 
+Your role is to help users understand their machine learning models, data analysis results, and visualizations.
+
+IMPORTANT GUIDELINES:
+- Answer questions naturally and conversationally, as if you're a helpful data scientist colleague
+- When users ask about "positive words", "negative words", or sentiment analysis, provide the actual word lists from the plot data with their scores
+- For open-ended questions like "what can you tell me about my data?", provide a comprehensive overview using all available context
+- Reference specific numbers, metrics, and findings from the analysis context
+- If the context contains plot summaries with structured data (like word sentiment lists, keyword frequencies, class distributions), extract and present that data clearly
+- Build on previous conversation context naturally - if a user asks "the negative ones?" after asking about positive words, understand the context
+- If information is missing, acknowledge it but provide what you can from available context
+- Format responses with clear sections, bullet points, or numbered lists when presenting multiple items
+- For visualization questions, describe what the plots show based on the plot summaries provided
+- Handle both text data analysis (sentiment, keywords) and image data analysis (class distributions, confusion matrices, embeddings)
+
+CONTEXT STRUCTURE:
+- Plot summaries contain structured data in JSON format that you should parse and use
+- Data statistics include dataset shape, columns, and data types
+- Model information includes model type, features, and performance metrics
+- Word sentiment data includes lists of positive_words and negative_words with scores
+- Image analysis includes class distributions, confusion matrices, and embedding visualizations
+
+Always prioritize accuracy and cite specific data from the context when available. Be conversational but precise."""
+        
+        # Create user prompt with formatted context and conversation history
+        user_prompt = f"""User Question: {question}
+
+{formatted_context}
+
+{conversation_context if conversation_context else ""}
+
+Please provide a helpful, natural response to the user's question. Use the structured data from plot summaries when available. Be specific with numbers and findings. If the question is open-ended, provide a comprehensive overview of what you can see in their data analysis. Reference specific data points from the context above."""
+        
+        print(f"DEBUG: Using OpenAI: {openai_client is not None}")
+        
+        # Generate response using OpenAI or fallback
+        if openai_client is None:
+            # Enhanced fallback response - use formatted context and plot summaries
+            return generate_structured_fallback_response(question, relevant_docs, plot_summaries, conversation_context)
+        
+        try:
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_tokens=1500,
+                temperature=0.7
+            )
+            
+            return response.choices[0].message.content
+        except Exception as e:
+            print(f"Error with OpenAI API: {e}")
+            # Fallback to structured response
+            return generate_structured_fallback_response(question, relevant_docs, plot_summaries, conversation_context)
+        
+    except Exception as e:
+        print(f"Error generating RAG response: {e}")
+        return f"I encountered an error while processing your question: {str(e)}"
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'healthy', 'service': 'ai_outputs_rag'})
+
+@app.route('/store-data', methods=['POST'])
+def store_data():
+    """Store user data information"""
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        data_info = data.get('data_info', {})
+        
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+        
+        # Store data info in vector database
+        data_doc = f"Dataset: Shape {data_info.get('shape', 'Unknown')}. "
+        if 'columns' in data_info:
+            columns = ', '.join(data_info['columns'])
+            data_doc += f"Columns: {columns}. "
+        if 'data_type' in data_info:
+            data_doc += f"Data type: {data_info['data_type']}."
+        
+        vector_db.add_document(
+            user_id=user_id,
+            text=data_doc,
+            metadata={
+                'doc_type': 'data_info',
+                'timestamp': datetime.now().isoformat(),
+                'data_info': data_info
+            }
+        )
+        
+        return jsonify({'message': 'Data information stored successfully'})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/store-interactive-plot', methods=['POST'])
+def store_interactive_plot():
+    """Store interactive plot metadata for chat grounding"""
+    try:
+        data = request.json or {}
+        user_id = data.get('user_id')
+        plot_data = data.get('plot_data', {})
+        query = data.get('query', '')
+
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+
+        plot_type = plot_data.get('plot_type', 'interactive')
+        metadata = plot_data.get('metadata', {})
+        plot_spec = metadata.get('plot_spec', {})
+
+        doc = f"Interactive Plot Request: {query}. Plot type: {plot_type}. "
+        if plot_spec:
+            doc += f"Plot spec: {json.dumps(plot_spec, default=str)}. "
+        if metadata:
+            doc += f"Metadata: {json.dumps(metadata, default=str)}."
+
+        vector_db.add_document(
+            user_id,
+            doc,
+            {
+                'doc_type': 'interactive_plot',
+                'plot_type': plot_type,
+                'query': query,
+                'plot_spec': plot_spec,
+                'timestamp': datetime.now().isoformat()
+            }
+        )
+
+        return jsonify({'message': 'Interactive plot stored successfully'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/store-results', methods=['POST'])
+def store_results():
+    """Store XAI results in vector database"""
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+        
+        # Store results in vector database
+        store_results_in_vector_db(data, user_id)
+        
+        return jsonify({'message': 'Results stored successfully'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/store-attention-insights', methods=['POST'])
+def store_attention_insights():
+    """Store attention analysis insights for AI assistant access"""
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        attention_analysis = data.get('attention_analysis', {})
+        
+        if not user_id:
+            return jsonify({'error': 'user_id is required'}), 400
+        
+        # Create attention insights document for vector database
+        example_text = attention_analysis.get('example_text', '')
+        insights = attention_analysis.get('insights', {})
+        
+        # Generate detailed attention insights document
+        attention_doc = f"Attention Analysis for: '{example_text[:100]}...'\n\n"
+        
+        # Top tokens information
+        top_tokens = insights.get('top_tokens', [])
+        if top_tokens:
+            attention_doc += "Top Important Tokens:\n"
+            for i, (token, score) in enumerate(top_tokens[:5], 1):
+                attention_doc += f"{i}. '{token}' (score: {score:.3f})\n"
+            attention_doc += "\n"
+        
+        # Attention metrics
+        max_score = insights.get('max_attention_score', 0)
+        variance = insights.get('attention_variance', 0)
+        concentration = insights.get('attention_concentration', 'unknown')
+        sentiment_corr = insights.get('sentiment_correlation', 'neutral')
+        
+        attention_doc += f"Attention Metrics:\n"
+        attention_doc += f"- Maximum attention score: {max_score:.3f}\n"
+        attention_doc += f"- Attention variance: {variance:.3f}\n"
+        attention_doc += f"- Attention pattern: {concentration}\n"
+        attention_doc += f"- Sentiment correlation: {sentiment_corr}\n"
+        
+        # Store in vector database
+        vector_db.add_document(
+            user_id,
+            attention_doc,
+            {
+                'doc_type': 'attention_analysis',
+                'example_index': attention_analysis.get('example_index', ''),
+                'model_type': attention_analysis.get('model_type', ''),
+                'insights': insights,
+                'timestamp': datetime.now().isoformat()
+            }
+        )
+        
+        return jsonify({'message': 'Attention insights stored successfully'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/results/<user_id>', methods=['GET'])
+def get_results(user_id):
+    """Get summary of stored results for a user"""
+    try:
+        if user_id not in vector_db.collections:
+            return jsonify({'error': 'No results found for user'}), 404
+        
+        collection = vector_db.collections[user_id]
+        
+        # Safely extract document types and timestamps
+        document_types = []
+        timestamps = []
+        
+        for doc in collection['metadata']:
+            if 'doc_type' in doc:
+                document_types.append(doc['doc_type'])
+            if 'timestamp' in doc:
+                timestamps.append(doc['timestamp'])
+        
+        summary = {
+            'user_id': user_id,
+            'total_documents': len(collection['documents']),
+            'document_types': list(set(document_types)),
+            'last_updated': max(timestamps) if timestamps else None
+        }
+        
+        return jsonify(summary)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """Handle chat questions using RAG approach"""
+    try:
+        data = request.json
+        question = data.get('question')
+        user_id = data.get('user_id')
+        
+        if not question or not user_id:
+            return jsonify({'error': 'Missing question or user_id'}), 400
+        
+        # Check if user has any stored results
+        if user_id not in vector_db.collections:
+            return jsonify({'error': 'No results found for user. Please upload and analyze a model first.'}), 404
+        
+        # Generate RAG response
+        answer = generate_rag_response(question, user_id)
+        
+        # Store conversation history
+        add_to_conversation_history(user_id, question, answer)
+        
+        return jsonify({
+            'answer': answer,
+            'user_id': user_id
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/clear-user-data/<user_id>', methods=['DELETE'])
+def clear_user_data(user_id):
+    """Clear all data for a specific user"""
+    try:
+        if user_id in vector_db.collections:
+            del vector_db.collections[user_id]
+        if user_id in conversation_history:
+            del conversation_history[user_id]
+        return jsonify({'message': f'All data cleared for user {user_id}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8001, debug=True)

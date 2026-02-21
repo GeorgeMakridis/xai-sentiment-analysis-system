@@ -1,0 +1,53 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Docker
+shared_volume/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Model files (large)
+*.pkl
+*.h5
+*.pt
+*.pth
+models/
+*.bin
+
+# Data files (large)
+*.csv
+*.parquet
+*.xlsx
+*.json
+!package.json
+!package-lock.json
+
+# Cookies
+cookies.txt
