@@ -57,6 +57,10 @@ def logout():
     session.pop('user_id', None)
     return redirect(url_for('login'))
 
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy', 'service': 'dashboard'})
+
 @app.route('/api/upload-data', methods=['POST'])
 def upload_data():
     if 'user_id' not in session:
@@ -304,7 +308,49 @@ def data_statistics():
         if response.status_code == 200:
             result = response.json()
             
-            # Store data statistics results in AI outputs service for chat functionality
+            # Store images in RestFS via ai_outputs and collect plot_ids
+            images_with_refs = []
+            for i, img_item in enumerate(result.get('images', [])):
+                image_b64 = img_item.get('image', '') if isinstance(img_item, dict) else img_item
+                img_type = img_item.get('type', f'plot_{i}') if isinstance(img_item, dict) else f'plot_{i}'
+                img_title = img_item.get('title', img_type) if isinstance(img_item, dict) else img_type
+                img_summary = img_item.get('summary', '') if isinstance(img_item, dict) else ''
+                img_data = img_item.get('data', {}) if isinstance(img_item, dict) else {}
+
+                if image_b64:
+                    try:
+                        store_resp = requests.post(
+                            f"{AI_OUTPUTS_SERVICE_URL}/api/store-plot-image",
+                            json={
+                                'user_id': user_id,
+                                'image': image_b64,
+                                'plot_type': img_type,
+                                'title': img_title,
+                                'description': img_summary,
+                                'summary_text': img_summary,
+                                'data': img_data,
+                            },
+                            timeout=30
+                        )
+                        if store_resp.status_code == 200:
+                            resp_data = store_resp.json()
+                            images_with_refs.append({
+                                'type': img_type,
+                                'plot_id': resp_data.get('plot_id', ''),
+                                'title': img_title,
+                                'summary': img_summary,
+                                'data': img_data,
+                            })
+                        else:
+                            # Fallback: keep base64
+                            images_with_refs.append(img_item if isinstance(img_item, dict) else {'image': img_item, 'type': img_type})
+                    except Exception as e:
+                        print(f"Warning: Failed to store plot image in RestFS: {e}")
+                        images_with_refs.append(img_item if isinstance(img_item, dict) else {'image': img_item, 'type': img_type})
+                else:
+                    images_with_refs.append(img_item if isinstance(img_item, dict) else {'type': img_type})
+
+            # Also store full results in ai_outputs for chat context
             try:
                 store_response = requests.post(f"{AI_OUTPUTS_SERVICE_URL}/store-results", json={
                     'user_id': user_id,
@@ -313,6 +359,8 @@ def data_statistics():
                         'images': result.get('images', []),
                         'data_type': result.get('data_type', 'unknown'),
                         'insights': result.get('insights', {}),
+                        'data_statistics': result.get('data_statistics', {}),
+                        'plot_summaries': result.get('plot_summaries', []),
                         'timestamp': datetime.now().isoformat()
                     }
                 })
@@ -325,8 +373,11 @@ def data_statistics():
             
             return jsonify({
                 'message': 'Data statistics generated successfully',
-                'images': result.get('images', []),
+                'images': images_with_refs,
                 'data_type': result.get('data_type', 'unknown'),
+                'data_shape': result.get('data_shape'),
+                'columns_count': result.get('columns_count'),
+                'overview_stats': result.get('overview_stats', {}),
                 'user_id': user_id
             })
         else:
@@ -334,6 +385,114 @@ def data_statistics():
             
     except Exception as e:
         return jsonify({'error': f'Failed to generate data statistics: {str(e)}'}), 500
+
+
+@app.route('/api/plot-image/<plot_id>')
+def proxy_plot_image(plot_id):
+    """Proxy plot images from ai_outputs service."""
+    if 'user_id' not in session:
+        return '', 401
+    
+    user_id = session['user_id']
+    try:
+        resp = requests.get(
+            f"{AI_OUTPUTS_SERVICE_URL}/api/plots/{plot_id}/image",
+            params={'user_id': user_id},
+            timeout=15
+        )
+        if resp.status_code == 200:
+            return resp.content, 200, {
+                'Content-Type': 'image/png',
+                'Cache-Control': 'public, max-age=3600'
+            }
+        return '', 404
+    except Exception:
+        return '', 502
+
+
+@app.route('/api/datasets')
+def list_datasets():
+    """List available datasets from RestFS + local for the current user."""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    user_id = session['user_id']
+    try:
+        resp = requests.get(
+            f"{AI_OUTPUTS_SERVICE_URL}/api/user-datasets/{user_id}",
+            timeout=10
+        )
+        if resp.status_code == 200:
+            return jsonify(resp.json())
+        return jsonify({'datasets': []})
+    except Exception:
+        # Fallback: scan local uploads
+        datasets = []
+        if os.path.isdir(UPLOAD_FOLDER):
+            for fname in os.listdir(UPLOAD_FOLDER):
+                fpath = os.path.join(UPLOAD_FOLDER, fname)
+                if os.path.isfile(fpath) and fname.endswith(('.csv', '.json', '.txt')):
+                    datasets.append({
+                        'filename': fname,
+                        'key': fpath,
+                        'size': os.path.getsize(fpath),
+                        'source': 'local',
+                    })
+        return jsonify({'datasets': datasets})
+
+
+@app.route('/api/select-dataset', methods=['POST'])
+def select_dataset():
+    """Select an existing dataset for analysis (instead of uploading)."""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    data = request.json
+    filename = data.get('filename')
+    data_type = data.get('data_type', 'text')
+    source = data.get('source', 'local')
+    
+    if not filename:
+        return jsonify({'error': 'No filename provided'}), 400
+    
+    # Determine file path
+    if source == 'local':
+        file_path = os.path.join(UPLOAD_FOLDER, filename)
+    else:
+        # For RestFS, download to local first so XAI service can read it
+        try:
+            resp = requests.get(
+                f"{AI_OUTPUTS_SERVICE_URL}/api/user-datasets/{session['user_id']}",
+                timeout=10
+            )
+            # The file may already exist locally
+            file_path = os.path.join(UPLOAD_FOLDER, filename)
+        except Exception:
+            file_path = os.path.join(UPLOAD_FOLDER, filename)
+    
+    if not os.path.exists(file_path):
+        return jsonify({'error': f'Dataset file not found: {filename}'}), 404
+    
+    # Trigger ingestion on XAI service
+    try:
+        response = requests.post(f"{XAI_SERVICE_URL}/ingest", json={
+            'file_path': file_path,
+            'user_id': session['user_id'],
+            'data_type': data_type
+        })
+        
+        if response.status_code == 200:
+            result = response.json()
+            return jsonify({
+                'message': f'Dataset "{filename}" loaded successfully',
+                'file_path': file_path,
+                'data_summary': result.get('data_summary', {})
+            })
+        else:
+            return jsonify({'error': 'Ingestion failed'}), 500
+    except Exception as e:
+        return jsonify({'error': f'Ingestion failed: {str(e)}'}), 500
+
 
 @app.route('/api/preprocess-data', methods=['POST'])
 def preprocess_data():

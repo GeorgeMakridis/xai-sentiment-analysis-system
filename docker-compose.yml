@@ -1,4 +1,30 @@
 services:
+  # ── RustFS (S3-compatible object storage) ───────────────────────
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs-server
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: ${RESTFS_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${RESTFS_SECRET_KEY:-rustfsadmin}
+    volumes:
+      - rustfs_data:/data
+    command: ["/data"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - app-network
+
+  # ── Dashboard ───────────────────────────────────────────────────
   dashboard:
     build: ./dashboard
     ports:
@@ -8,9 +34,13 @@ services:
     depends_on:
       - xai_service
       - ai_outputs
+      - rustfs
     environment:
       - XAI_SERVICE_URL=${XAI_SERVICE_URL:-http://xai_service:8000}
       - AI_OUTPUTS_SERVICE_URL=${AI_OUTPUTS_SERVICE_URL:-http://ai_outputs:8001}
+      - RESTFS_ENDPOINT=${RESTFS_ENDPOINT:-rustfs:9000}
+      - RESTFS_ACCESS_KEY=${RESTFS_ACCESS_KEY:-rustfsadmin}
+      - RESTFS_SECRET_KEY=${RESTFS_SECRET_KEY:-rustfsadmin}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - LOG_FORMAT=${LOG_FORMAT:-json}
     healthcheck:
@@ -22,14 +52,20 @@ services:
     networks:
       - app-network
 
+  # ── XAI Service ─────────────────────────────────────────────────
   xai_service:
     build: ./xai_service
     ports:
       - "8000:8000"
     volumes:
       - ./shared_volume:/app/shared_data
+    depends_on:
+      - rustfs
     environment:
       - AI_OUTPUTS_SERVICE_URL=${AI_OUTPUTS_SERVICE_URL:-http://ai_outputs:8001}
+      - RESTFS_ENDPOINT=${RESTFS_ENDPOINT:-rustfs:9000}
+      - RESTFS_ACCESS_KEY=${RESTFS_ACCESS_KEY:-rustfsadmin}
+      - RESTFS_SECRET_KEY=${RESTFS_SECRET_KEY:-rustfsadmin}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - LOG_FORMAT=${LOG_FORMAT:-json}
@@ -42,14 +78,20 @@ services:
     networks:
       - app-network
 
+  # ── AI Outputs (RAG + Chat) ────────────────────────────────────
   ai_outputs:
     build: ./ai_outputs
     ports:
       - "8002:8001"
     volumes:
       - ./shared_volume:/app/shared_data
+    depends_on:
+      - rustfs
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - RESTFS_ENDPOINT=${RESTFS_ENDPOINT:-rustfs:9000}
+      - RESTFS_ACCESS_KEY=${RESTFS_ACCESS_KEY:-rustfsadmin}
+      - RESTFS_SECRET_KEY=${RESTFS_SECRET_KEY:-rustfsadmin}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - LOG_FORMAT=${LOG_FORMAT:-json}
       - MAX_FILE_SIZE=${MAX_FILE_SIZE:-10485760}
@@ -62,6 +104,9 @@ services:
       start_period: 40s
     networks:
       - app-network
+
+volumes:
+  rustfs_data:
 
 networks:
   app-network:

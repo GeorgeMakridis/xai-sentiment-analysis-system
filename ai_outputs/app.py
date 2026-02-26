@@ -22,6 +22,9 @@ from storage_abstraction import (
     load_registry,
     save_registry,
     delete_plot_file,
+    save_plot_image,
+    load_plot_image,
+    load_plot_image_b64,
 )
 
 # Configure logging
@@ -1123,7 +1126,9 @@ CRITICAL CONSTRAINTS - YOU MUST FOLLOW THESE:
    - Only use confidence values that match the provided score
    - If you're not sure, say so rather than guessing
 
-Your goal is to provide a faithful, grounded explanation that accurately reflects the XAI analysis results."""
+Your goal is to provide a faithful, grounded explanation that accurately reflects the XAI analysis results.
+
+Do NOT use markdown formatting (no **, ##, ```, -, * bullets). Write in plain text with natural sentence structure."""
 
     user_prompt = f"""User Question: {question}
 
@@ -1199,7 +1204,8 @@ def generate_naive_rag_response(question: str, user_id: str) -> str:
         
         # Naive system prompt (no constraints)
         system_prompt = """You are an AI assistant explaining sentiment analysis predictions. 
-Explain the prediction based on the context provided. Be helpful and informative."""
+Explain the prediction based on the context provided. Be helpful and informative.
+Do NOT use markdown formatting (no **, ##, ```, -, * bullets). Write in plain text with natural sentence structure."""
 
         # Naive user prompt (no constraints)
         user_prompt = f"""User Question: {question}
@@ -1379,7 +1385,7 @@ DATA INTERPRETATION GUIDELINES:
 TONE:
 - Be conversational but authoritative
 - Use clear, concise language
-- Structure responses with headers, bullet points, or numbered lists
+- IMPORTANT: Do NOT use markdown formatting (no **, ##, ```, -, * bullets, etc.). Write in plain text with natural sentence structure. Use numbered lists (1. 2. 3.) only when listing steps. Separate sections with blank lines instead of headers.
 - Always end with actionable next steps or recommendations
 
 CONTEXT STRUCTURE:
@@ -1458,6 +1464,131 @@ Remember: Always provide insights and reasoning, never just report data. Referen
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'healthy', 'service': 'ai_outputs_rag'})
+
+
+# --------------------------------------------------------------------------
+# RestFS plot image endpoints
+# --------------------------------------------------------------------------
+
+@app.route('/api/store-plot-image', methods=['POST'])
+def store_plot_image_endpoint():
+    """Store a plot image (base64 PNG) to RestFS and register metadata."""
+    try:
+        data = request.json or {}
+        user_id = data.get('user_id')
+        plot_id = data.get('plot_id') or uuid.uuid4().hex
+        image_b64 = data.get('image')
+        plot_type = data.get('plot_type', 'unknown')
+        title = data.get('title', '')
+        description = data.get('description', '')
+        summary_data = data.get('data', {})
+        summary_text = data.get('summary_text', '')
+        dataset_id = data.get('dataset_id', '')
+
+        if not user_id or not image_b64:
+            return jsonify({'error': 'Missing user_id or image'}), 400
+
+        ref = save_plot_image(image_b64, user_id, plot_id,
+                              metadata={'plot_type': plot_type, 'title': title})
+
+        meta = build_plot_metadata(
+            user_id=user_id, plot_type=plot_type, query='',
+            plot_spec={},
+            plot_summary={'title': title, 'description': description,
+                          'data': summary_data, 'summary_text': summary_text},
+            dataset_id=dataset_id, data_mode='auto', plot_id=plot_id,
+        )
+        meta['image_ref'] = ref
+
+        plots = load_registry(user_id)
+        plots.append(meta)
+        save_registry(user_id, plots)
+
+        doc = f"{title}. Plot type: {plot_type}. "
+        if description:
+            doc += f"Description: {description}. "
+        if summary_text:
+            doc += f"Summary: {summary_text}. "
+        if summary_data:
+            doc += f"Data: {json.dumps(summary_data, default=str)}. "
+
+        vector_db.add_document(user_id, doc, {
+            'doc_type': 'plot_summary', 'plot_type': plot_type,
+            'source': 'restfs_plot_image', 'title': title,
+            'description': description, 'data': summary_data,
+            'summary_text': summary_text, 'image_ref': ref,
+            'plot_id': plot_id, 'timestamp': datetime.now().isoformat()
+        })
+
+        return jsonify({'message': 'Plot image stored', 'plot_id': plot_id, 'image_ref': ref})
+    except Exception as e:
+        logger.exception('store_plot_image_endpoint failed')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/plots/<plot_id>/image', methods=['GET'])
+def serve_plot_image(plot_id):
+    """Serve a plot PNG image by plot_id."""
+    try:
+        user_id = request.args.get('user_id')
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+
+        plots = load_registry(user_id)
+        ref = ''
+        for p in plots:
+            if p.get('plot_id') == plot_id:
+                ref = p.get('image_ref', '')
+                break
+
+        img_bytes = load_plot_image(ref, user_id, plot_id)
+        if img_bytes:
+            return img_bytes, 200, {'Content-Type': 'image/png',
+                                    'Cache-Control': 'public, max-age=3600'}
+        return jsonify({'error': 'Image not found'}), 404
+    except Exception as e:
+        logger.exception('serve_plot_image failed')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/user-datasets/<user_id>', methods=['GET'])
+def list_user_datasets_restfs(user_id):
+    """List datasets available in RestFS + local for a user."""
+    try:
+        datasets = []
+        try:
+            import restfs_client as _restfs
+            if _restfs.is_available():
+                for obj in _restfs.list_user_datasets(user_id):
+                    fname = obj['key'].split('/')[-1] if '/' in obj['key'] else obj['key']
+                    datasets.append({'filename': fname, 'key': obj['key'],
+                                     'size': obj.get('size', 0),
+                                     'last_modified': obj.get('last_modified'),
+                                     'source': 'restfs'})
+        except Exception:
+            pass
+
+        uploads_dir = os.path.join(SHARED_DATA_DIR, 'uploads')
+        if os.path.isdir(uploads_dir):
+            for fname in os.listdir(uploads_dir):
+                fpath = os.path.join(uploads_dir, fname)
+                if os.path.isfile(fpath) and fname.endswith(('.csv', '.json', '.txt')):
+                    datasets.append({'filename': fname, 'key': fpath,
+                                     'size': os.path.getsize(fpath),
+                                     'last_modified': datetime.fromtimestamp(
+                                         os.path.getmtime(fpath)).isoformat(),
+                                     'source': 'local'})
+
+        seen = set()
+        unique = []
+        for d in datasets:
+            if d['filename'] not in seen:
+                seen.add(d['filename'])
+                unique.append(d)
+        return jsonify({'datasets': unique})
+    except Exception as e:
+        logger.exception('list_user_datasets_restfs failed')
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/store-data', methods=['POST'])
 def store_data():
