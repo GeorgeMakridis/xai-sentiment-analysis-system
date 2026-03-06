@@ -15,6 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application files
 COPY . .
 
+# Auth module is mounted at /app/auth by docker-compose
+ENV PYTHONPATH="/app:/app/auth:${PYTHONPATH}"
+
 # Create shared data directory
 RUN mkdir -p /app/shared_data
 

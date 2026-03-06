@@ -16,6 +16,7 @@ import pickle
 from faithfulness_evaluator import FaithfulnessEvaluator
 from test_set_generator import TestSetGenerator
 from plot_metadata_schema import build_plot_metadata
+from vector_store import index_plot, index_plots_batch, rehydrate_from_restfs
 from storage_abstraction import (
     save_plot_html,
     load_plot_html,
@@ -49,9 +50,9 @@ os.makedirs(VECTOR_DB_FOLDER, exist_ok=True)
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 if OPENAI_API_KEY and OPENAI_API_KEY != 'your-openai-api-key':
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    print("OpenAI API key configured successfully.")
+    logger.info("OpenAI API key configured successfully.")
 else:
-    print("Warning: OpenAI API key not set. Using fallback responses.")
+    logger.warning("OpenAI API key not set. Using fallback responses.")
     openai_client = None
 
 # Global storage for vector database (in production, use a proper vector DB like Pinecone, Weaviate, etc.)
@@ -90,6 +91,10 @@ class VectorDatabase:
         self.collections[user_id]['embeddings'].append(embedding)
         self.collections[user_id]['metadata'].append(metadata)
     
+    def has_documents(self, user_id: str) -> bool:
+        """Check if user has any documents in the vector DB."""
+        return user_id in self.collections and len(self.collections[user_id]['documents']) > 0
+
     def search(self, user_id: str, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Search for relevant documents"""
         if user_id not in self.collections:
@@ -136,7 +141,7 @@ class VectorDatabase:
             )
             return response.data[0].embedding
         except Exception as e:
-            print(f"Error getting embedding: {e}")
+            logger.error("Error getting embedding: %s", e)
             # Return a dummy embedding if OpenAI fails
             return [0.0] * 1536
     
@@ -178,7 +183,7 @@ def save_image_to_shared_volume(image_data: str, user_id: str, image_type: str) 
         
         return file_path
     except Exception as e:
-        print(f"Error saving image: {e}")
+        logger.error("Error saving image: %s", e)
         return None
 
 def create_analysis_context(results: Dict[str, Any], user_id: str) -> List[str]:
@@ -317,10 +322,10 @@ def save_results_to_shared_volume(results: Dict[str, Any], user_id: str) -> Opti
         with open(file_path, 'w') as f:
             json.dump(results, f, indent=2, default=str)
         
-        print(f"Saved results to {file_path}")
+        logger.info("Saved results to %s", file_path)
         return file_path
     except Exception as e:
-        print(f"Error saving results to shared volume: {e}")
+        logger.error("Error saving results to shared volume: %s", e)
         return None
 
 def store_results_in_vector_db(results: Dict[str, Any], user_id: str):
@@ -329,47 +334,13 @@ def store_results_in_vector_db(results: Dict[str, Any], user_id: str):
         # Save results to shared volume first
         save_results_to_shared_volume(results, user_id)
 
-        def store_plot_summary(summary: Dict[str, Any], source: str):
-            title = summary.get('title', 'Plot Summary')
-            plot_type = summary.get('plot_type', summary.get('type', 'unknown'))
-            description = summary.get('description', '')
-            data = summary.get('data', {})
-            metadata = summary.get('metadata', {})
-            summary_text = summary.get('summary_text', '')
-
-            doc = f"{title}. Plot type: {plot_type}. "
-            if description:
-                doc += f"Description: {description}. "
-            if summary_text:
-                doc += f"Summary: {summary_text}. "
-            if data:
-                doc += f"Data: {json.dumps(data, default=str)}. "
-            if metadata:
-                doc += f"Metadata: {json.dumps(metadata, default=str)}."
-
-            vector_db.add_document(
-                user_id,
-                doc,
-                {
-                    'doc_type': 'plot_summary',
-                    'plot_type': plot_type,
-                    'source': source,
-                    'title': title,
-                    'description': description,
-                    'data': data,
-                    'summary_text': summary_text,
-                    'metadata': metadata,
-                    'timestamp': datetime.now().isoformat()
-                }
-            )
-        
         # Handle different types of results
         result_type = results.get('type', 'unknown')
 
         if 'plot_summaries' in results and isinstance(results['plot_summaries'], list):
             for summary in results['plot_summaries']:
                 if isinstance(summary, dict):
-                    store_plot_summary(summary, source='results_plot_summaries')
+                    index_plot(vector_db, user_id, summary, source='results_plot_summaries')
         
         # Check for data_statistics in the new format
         if 'data_statistics' in results:
@@ -390,16 +361,12 @@ def store_results_in_vector_db(results: Dict[str, Any], user_id: str):
             
             # Add actual plot data to the document
             plot_data = data_stats.get('plot_data', {})
-            import sys
-            sys.stdout.write(f"DEBUG: Received plot_data keys: {list(plot_data.keys())}\n")
-            sys.stdout.flush()
             if 'word_sentiment' in plot_data:
-                sys.stdout.write(f"DEBUG: Found word_sentiment in plot_data, storing plot summary\n")
-                sys.stdout.flush()
                 word_sentiment = plot_data['word_sentiment']
-                sys.stdout.write(f"DEBUG: word_sentiment has positive_words: {bool(word_sentiment.get('positive_words'))}, negative_words: {bool(word_sentiment.get('negative_words'))}\n")
-                sys.stdout.flush()
-                word_sentiment = plot_data['word_sentiment']
+                logger.debug("Received plot_data keys: %s; word_sentiment positive=%s negative=%s",
+                            list(plot_data.keys()),
+                            bool(word_sentiment.get('positive_words')),
+                            bool(word_sentiment.get('negative_words')))
                 pos_words = word_sentiment.get('positive_words', [])
                 neg_words = word_sentiment.get('negative_words', [])
                 
@@ -407,37 +374,31 @@ def store_results_in_vector_db(results: Dict[str, Any], user_id: str):
                     data_doc += f" Top 10 positive words: {', '.join([f'{word}({score:.2f})' for word, score in pos_words[:5]])}. "
                 if neg_words:
                     data_doc += f" Top 10 negative words: {', '.join([f'{word}({score:.2f})' for word, score in neg_words[:5]])}. "
-                store_plot_summary(
-                    {
-                        'title': 'Word Sentiment Associations',
-                        'plot_type': 'word_sentiment_association',
-                        'description': 'Top words driving positive and negative sentiment.',
-                        'data': word_sentiment,
-                        'summary_text': 'Top positive and negative sentiment-associated words.'
-                    },
-                    source='data_statistics_plot_data'
-                )
+                index_plot(vector_db, user_id, {
+                    'title': 'Word Sentiment Associations',
+                    'plot_type': 'word_sentiment_association',
+                    'description': 'Top words driving positive and negative sentiment.',
+                    'data': word_sentiment,
+                    'summary_text': 'Top positive and negative sentiment-associated words.'
+                }, source='data_statistics_plot_data')
             
             if 'keywords' in plot_data:
                 keywords = plot_data['keywords'].get('top_keywords', [])
                 if keywords:
                     data_doc += f" Top 15 keywords: {', '.join([f'{word}({count})' for word, count in keywords[:5]])}. "
-                store_plot_summary(
-                    {
-                        'title': 'Top Keywords',
-                        'plot_type': 'keyword_frequency',
-                        'description': 'Most frequent words in titles.',
-                        'data': plot_data.get('keywords', {}),
-                        'summary_text': 'Most frequent keywords in the dataset.'
-                    },
-                    source='data_statistics_plot_data'
-                )
+                index_plot(vector_db, user_id, {
+                    'title': 'Top Keywords',
+                    'plot_type': 'keyword_frequency',
+                    'description': 'Most frequent words in titles.',
+                    'data': plot_data.get('keywords', {}),
+                    'summary_text': 'Most frequent keywords in the dataset.'
+                }, source='data_statistics_plot_data')
             
             # Also store plot_summaries if they're included directly in data_statistics
             if 'plot_summaries' in data_stats and isinstance(data_stats['plot_summaries'], list):
                 for summary in data_stats['plot_summaries']:
                     if isinstance(summary, dict):
-                        store_plot_summary(summary, source='data_statistics_plot_summaries')
+                        index_plot(vector_db, user_id, summary, source='data_statistics_plot_summaries')
             
             metadata = {
                 'user_id': user_id,
@@ -479,7 +440,7 @@ def store_results_in_vector_db(results: Dict[str, Any], user_id: str):
                                 'metadata': image_data.get('metadata', {}),
                                 'summary_text': image_data.get('summary')
                             }
-                            store_plot_summary(summary_payload, source='data_statistics_images')
+                            index_plot(vector_db, user_id, summary_payload, source='data_statistics_images')
                         if isinstance(image_data, dict) and image_data.get('summary'):
                             summary_payload = {
                                 'title': image_data.get('title', f"Data Statistics Visualization {i+1}"),
@@ -489,7 +450,7 @@ def store_results_in_vector_db(results: Dict[str, Any], user_id: str):
                                 'metadata': image_data.get('metadata', {}),
                                 'summary_text': image_data.get('summary')
                             }
-                            store_plot_summary(summary_payload, source='data_statistics_images')
+                            index_plot(vector_db, user_id, summary_payload, source='data_statistics_images')
                     elif isinstance(image_data, str):
                         # Direct base64 string
                         image_path = save_image_to_shared_volume(image_data, user_id, image_type)
@@ -514,7 +475,7 @@ def store_results_in_vector_db(results: Dict[str, Any], user_id: str):
                                 'metadata': image_data.get('metadata', {}),
                                 'summary_text': image_data.get('summary')
                             }
-                            store_plot_summary(summary_payload, source='data_statistics_images')
+                            index_plot(vector_db, user_id, summary_payload, source='data_statistics_images')
                         if isinstance(image_data, dict) and image_data.get('summary'):
                             summary_payload = {
                                 'title': image_data.get('title', f"Data Statistics Visualization {i+1}"),
@@ -524,7 +485,7 @@ def store_results_in_vector_db(results: Dict[str, Any], user_id: str):
                                 'metadata': image_data.get('metadata', {}),
                                 'summary_text': image_data.get('summary')
                             }
-                            store_plot_summary(summary_payload, source='data_statistics_images')
+                            index_plot(vector_db, user_id, summary_payload, source='data_statistics_images')
         
         elif result_type == 'data_statistics':
             # Store data statistics results
@@ -545,27 +506,21 @@ def store_results_in_vector_db(results: Dict[str, Any], user_id: str):
 
             plot_data = results.get('plot_data', {})
             if 'word_sentiment' in plot_data:
-                store_plot_summary(
-                    {
-                        'title': 'Word Sentiment Associations',
-                        'plot_type': 'word_sentiment_association',
-                        'description': 'Top words driving positive and negative sentiment.',
-                        'data': plot_data.get('word_sentiment', {}),
-                        'summary_text': 'Top positive and negative sentiment-associated words.'
-                    },
-                    source='data_statistics_plot_data'
-                )
+                index_plot(vector_db, user_id, {
+                    'title': 'Word Sentiment Associations',
+                    'plot_type': 'word_sentiment_association',
+                    'description': 'Top words driving positive and negative sentiment.',
+                    'data': plot_data.get('word_sentiment', {}),
+                    'summary_text': 'Top positive and negative sentiment-associated words.'
+                }, source='data_statistics_plot_data')
             if 'keywords' in plot_data:
-                store_plot_summary(
-                    {
-                        'title': 'Top Keywords',
-                        'plot_type': 'keyword_frequency',
-                        'description': 'Most frequent words in titles.',
-                        'data': plot_data.get('keywords', {}),
-                        'summary_text': 'Most frequent keywords in the dataset.'
-                    },
-                    source='data_statistics_plot_data'
-                )
+                index_plot(vector_db, user_id, {
+                    'title': 'Top Keywords',
+                    'plot_type': 'keyword_frequency',
+                    'description': 'Most frequent words in titles.',
+                    'data': plot_data.get('keywords', {}),
+                    'summary_text': 'Most frequent keywords in the dataset.'
+                }, source='data_statistics_plot_data')
             
             # Store images and their metadata
             if 'images' in results:
@@ -707,7 +662,7 @@ def store_results_in_vector_db(results: Dict[str, Any], user_id: str):
                             'metadata': viz_data.get('metadata', {}),
                             'summary_text': viz_data.get('summary')
                         }
-                        store_plot_summary(summary_payload, source='xai_visualizations')
+                        index_plot(vector_db, user_id, summary_payload, source='xai_visualizations')
         
         else:
             # Handle legacy results format
@@ -750,12 +705,12 @@ def store_results_in_vector_db(results: Dict[str, Any], user_id: str):
                             'metadata': image_data.get('metadata', {}),
                             'summary_text': image_data.get('summary')
                         }
-                        store_plot_summary(summary_payload, source='results_images')
+                        index_plot(vector_db, user_id, summary_payload, source='results_images')
         
-        print(f"Stored results in vector database for user {user_id}, type: {result_type}")
+        logger.info("Stored results in vector database for user %s, type: %s", user_id, result_type)
         
     except Exception as e:
-        print(f"Error storing results in vector database: {e}")
+        logger.error("Error storing results in vector database: %s", e)
 
 def add_to_conversation_history(user_id: str, question: str, answer: str):
     """Add a question-answer pair to user's conversation history"""
@@ -1235,11 +1190,11 @@ Please explain the sentiment prediction based on the context above."""
             
             return response.choices[0].message.content
         except Exception as e:
-            print(f"Error with OpenAI API: {e}")
+            logger.error("Error with OpenAI API: %s", e)
             return generate_structured_fallback_response(question, relevant_docs, plot_summaries, conversation_context, user_id)
         
     except Exception as e:
-        print(f"Error generating naive RAG response: {e}")
+        logger.error("Error generating naive RAG response: %s", e)
         return f"I encountered an error while processing your question: {str(e)}"
 
 
@@ -1249,9 +1204,9 @@ def generate_rag_response(question: str, user_id: str, use_constrained: bool = T
         # Search for relevant context
         relevant_docs = vector_db.search(user_id, question, top_k=8)  # Increased for richer context
         
-        print(f"DEBUG: Found {len(relevant_docs)} relevant documents for question: '{question}'")
+        logger.debug("Found %d relevant documents for question: '%s'", len(relevant_docs), question)
         for i, doc in enumerate(relevant_docs):
-            print(f"DEBUG: Doc {i+1}: {doc['text'][:100]}... (similarity: {doc['similarity']:.3f})")
+            logger.debug("Doc %d: %s... (similarity: %.3f)", i+1, doc['text'][:100], doc['similarity'])
         
         if not relevant_docs:
             return "I don't have access to your analysis results yet. Please upload and analyze a model first."
@@ -1266,8 +1221,8 @@ def generate_rag_response(question: str, user_id: str, use_constrained: bool = T
                 meta = doc.get('metadata', {})
                 plot_type = meta.get('plot_type', '')
                 data = meta.get('data')
-                sys.stdout.write(f"DEBUG extract: plot_type={plot_type}, data_type={type(data)}, data_keys={list(data.keys()) if isinstance(data, dict) else 'not_dict'}\n")
-                sys.stdout.flush()
+                logger.debug("extract: plot_type=%s, data_type=%s, data_keys=%s",
+                             plot_type, type(data), list(data.keys()) if isinstance(data, dict) else 'not_dict')
                 if not data and isinstance(doc.get('text'), str):
                     # Try to parse data from the text payload: "Data: {...}."
                     text = doc['text']
@@ -1279,15 +1234,16 @@ def generate_rag_response(question: str, user_id: str, use_constrained: bool = T
                                 data_str = data_str.split("Metadata:", 1)[0]
                             data_str = data_str.strip().rstrip(". ")
                             data = json.loads(data_str)
-                            sys.stdout.write(f"DEBUG extract: Parsed data from text, keys={list(data.keys()) if isinstance(data, dict) else 'not_dict'}\n")
-                            sys.stdout.flush()
+                            logger.debug("extract: Parsed data from text, keys=%s",
+                                         list(data.keys()) if isinstance(data, dict) else 'not_dict')
                         except Exception as e:
-                            sys.stdout.write(f"DEBUG extract: Failed to parse data from text: {e}\n")
-                            sys.stdout.flush()
+                            logger.debug("extract: Failed to parse data from text: %s", e)
                             data = None
                 summary_data = data or {}
-                sys.stdout.write(f"DEBUG extract: Final summary_data keys={list(summary_data.keys()) if isinstance(summary_data, dict) else 'not_dict'}, has_pos={bool(summary_data.get('positive_words') if isinstance(summary_data, dict) else False)}, has_neg={bool(summary_data.get('negative_words') if isinstance(summary_data, dict) else False)}\n")
-                sys.stdout.flush()
+                logger.debug("extract: Final summary_data keys=%s, has_pos=%s, has_neg=%s",
+                             list(summary_data.keys()) if isinstance(summary_data, dict) else 'not_dict',
+                             bool(summary_data.get('positive_words') if isinstance(summary_data, dict) else False),
+                             bool(summary_data.get('negative_words') if isinstance(summary_data, dict) else False))
                 summaries.append({
                     'title': meta.get('title', ''),
                     'plot_type': plot_type,
@@ -1325,11 +1281,14 @@ def generate_rag_response(question: str, user_id: str, use_constrained: bool = T
         # Extract XAI artifacts for constrained prompt
         xai_artifacts = extract_xai_artifacts_from_docs(relevant_docs)
         
-        print(f"DEBUG: Context length: {len(formatted_context)} characters")
-        print(f"DEBUG: Context preview: {formatted_context[:200]}...")
-        print(f"DEBUG: Conversation context length: {len(conversation_context)} characters")
-        print(f"DEBUG: Found {len(plot_summaries)} plot summaries")
-        print(f"DEBUG: XAI artifacts - LIME: {len(xai_artifacts.get('lime_features', []))}, Attention: {len(xai_artifacts.get('attention_tokens', []))}, Confidence: {xai_artifacts.get('confidence_score')}")
+        logger.debug("Context length: %d characters", len(formatted_context))
+        logger.debug("Context preview: %s...", formatted_context[:200])
+        logger.debug("Conversation context length: %d characters", len(conversation_context))
+        logger.debug("Found %d plot summaries", len(plot_summaries))
+        logger.debug("XAI artifacts - LIME: %d, Attention: %d, Confidence: %s",
+                    len(xai_artifacts.get('lime_features', [])),
+                    len(xai_artifacts.get('attention_tokens', [])),
+                    xai_artifacts.get('confidence_score'))
         
         # Use constrained prompt if requested and artifacts available
         if use_constrained and (xai_artifacts.get('lime_features') or xai_artifacts.get('attention_tokens') or xai_artifacts.get('confidence_score')):
@@ -1433,7 +1392,7 @@ PLOT DATA USAGE:
 
 Remember: Always provide insights and reasoning, never just report data. Reference specific plots and use actual numbers from the data provided."""
         
-        print(f"DEBUG: Using OpenAI: {openai_client is not None}")
+        logger.debug("Using OpenAI: %s", openai_client is not None)
         
         # Generate response using OpenAI or fallback
         if openai_client is None:
@@ -1453,12 +1412,12 @@ Remember: Always provide insights and reasoning, never just report data. Referen
             
             return response.choices[0].message.content
         except Exception as e:
-            print(f"Error with OpenAI API: {e}")
+            logger.error("Error with OpenAI API: %s", e)
             # Fallback to structured response
             return generate_structured_fallback_response(question, relevant_docs, plot_summaries, conversation_context, user_id)
         
     except Exception as e:
-        print(f"Error generating RAG response: {e}")
+        logger.error("Error generating RAG response: %s", e)
         return f"I encountered an error while processing your question: {str(e)}"
 
 @app.route('/health', methods=['GET'])
@@ -1492,33 +1451,24 @@ def store_plot_image_endpoint():
                               metadata={'plot_type': plot_type, 'title': title})
 
         meta = build_plot_metadata(
-            user_id=user_id, plot_type=plot_type, query='',
-            plot_spec={},
+            user_id=user_id, plot_type=plot_type, title=title,
+            description=description, summary_text=summary_text,
             plot_summary={'title': title, 'description': description,
-                          'data': summary_data, 'summary_text': summary_text},
-            dataset_id=dataset_id, data_mode='auto', plot_id=plot_id,
+                         'data': summary_data, 'summary_text': summary_text},
+            dataset_id=dataset_id, data_mode='text', plot_id=plot_id,
+            image_ref=ref,
         )
-        meta['image_ref'] = ref
+        meta['image_ref'] = ref  # backward compat for registry readers
 
         plots = load_registry(user_id)
         plots.append(meta)
         save_registry(user_id, plots)
 
-        doc = f"{title}. Plot type: {plot_type}. "
-        if description:
-            doc += f"Description: {description}. "
-        if summary_text:
-            doc += f"Summary: {summary_text}. "
-        if summary_data:
-            doc += f"Data: {json.dumps(summary_data, default=str)}. "
-
-        vector_db.add_document(user_id, doc, {
-            'doc_type': 'plot_summary', 'plot_type': plot_type,
-            'source': 'restfs_plot_image', 'title': title,
-            'description': description, 'data': summary_data,
-            'summary_text': summary_text, 'image_ref': ref,
-            'plot_id': plot_id, 'timestamp': datetime.now().isoformat()
-        })
+        index_plot(vector_db, user_id, {
+            'title': title, 'plot_type': plot_type, 'description': description,
+            'summary_text': summary_text, 'data': summary_data,
+        }, source='restfs_plot_image', plot_id=plot_id, image_ref=ref,
+           dataset_id=dataset_id)
 
         return jsonify({'message': 'Plot image stored', 'plot_id': plot_id, 'image_ref': ref})
     except Exception as e:
@@ -1647,14 +1597,15 @@ def store_interactive_plot():
         data_mode = data.get('data_mode', metadata.get('data_mode', 'image'))
         tags = data.get('tags') or []
 
-        # Build full metadata for registry
+        # Build full metadata for registry (new schema)
         meta = build_plot_metadata(
             user_id=user_id,
             plot_type=plot_type,
+            title=(plot_summary or {}).get('title', f'Interactive Plot: {query[:50]}'),
+            description=(plot_summary or {}).get('description', ''),
             query=query,
             plot_spec=plot_spec,
             plot_summary=plot_summary,
-            plot_html=plot_html,
             dataset_id=dataset_id,
             file_path=file_path,
             file_name=file_name,
@@ -1665,7 +1616,8 @@ def store_interactive_plot():
         # Save plot HTML to disk and set path in metadata
         if plot_html:
             html_path = save_plot_html(plot_html, user_id, meta['plot_id'])
-            meta['plot_html_path'] = html_path
+            meta['storage']['html_ref'] = html_path
+            meta['plot_html_path'] = html_path  # backward compat
 
         # Append to user's plot registry
         plots = load_registry(user_id)
@@ -1952,6 +1904,10 @@ def chat():
         
         if not question or not user_id:
             return jsonify({'error': 'Missing question or user_id'}), 400
+        
+        # Rehydrate from RustFS if vector DB is empty for this user
+        if not vector_db.has_documents(user_id):
+            rehydrate_from_restfs(vector_db, user_id)
         
         # Check if user has any stored results
         if user_id not in vector_db.collections:

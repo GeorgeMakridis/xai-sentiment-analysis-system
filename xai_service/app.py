@@ -28,6 +28,13 @@ import torch
 from lime.lime_text import LimeTextExplainer
 import requests
 
+from ai_adapter import (
+    is_external_adapter_configured,
+    get_predictions,
+    get_explanations,
+    get_model_info,
+)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -771,116 +778,6 @@ def generate_comprehensive_xai_visualizations(model, X_train, feature_names, mod
     
     print(f"Generated {len(images)} visualizations")
     return images, shap_summary
-
-def generate_xai_visualizations(model, X_train, feature_names, user_id):
-    """Generate various XAI visualizations"""
-    images = []
-    
-    # Set style for matplotlib
-    plt.style.use('default')
-    sns.set_palette("husl")
-    
-    # 1. Feature Importance Plot
-    plt.figure(figsize=(10, 6))
-    feature_importance = pd.DataFrame({
-        'feature': feature_names,
-        'importance': model.feature_importances_
-    }).sort_values('importance', ascending=True)
-    
-    plt.barh(range(len(feature_importance)), feature_importance['importance'])
-    plt.yticks(range(len(feature_importance)), feature_importance['feature'])
-    plt.xlabel('Feature Importance')
-    plt.title('Random Forest Feature Importance')
-    plt.tight_layout()
-    
-    # Save to base64
-    img_buffer = io.BytesIO()
-    plt.savefig(img_buffer, format='png', dpi=300, bbox_inches='tight')
-    img_buffer.seek(0)
-    images.append(base64.b64encode(img_buffer.getvalue()).decode())
-    plt.close()
-    
-    # 2. SHAP Summary Plot
-    try:
-        explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(X_train)
-        
-        plt.figure(figsize=(10, 6))
-        shap.summary_plot(shap_values, X_train, feature_names=feature_names, show=False)
-        plt.title('SHAP Summary Plot')
-        plt.tight_layout()
-        
-        img_buffer = io.BytesIO()
-        plt.savefig(img_buffer, format='png', dpi=300, bbox_inches='tight')
-        img_buffer.seek(0)
-        images.append(base64.b64encode(img_buffer.getvalue()).decode())
-        plt.close()
-    except Exception as e:
-        print(f"SHAP plot failed: {e}")
-    
-    # 3. Correlation Heatmap
-    plt.figure(figsize=(10, 8))
-    correlation_matrix = X_train.corr()
-    sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', center=0, 
-                square=True, linewidths=0.5)
-    plt.title('Feature Correlation Heatmap')
-    plt.tight_layout()
-    
-    img_buffer = io.BytesIO()
-    plt.savefig(img_buffer, format='png', dpi=300, bbox_inches='tight')
-    img_buffer.seek(0)
-    images.append(base64.b64encode(img_buffer.getvalue()).decode())
-    plt.close()
-    
-    # 4. Distribution Plots
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    axes = axes.ravel()
-    
-    for i, feature in enumerate(feature_names[:6]):
-        axes[i].hist(X_train[feature], bins=30, alpha=0.7, edgecolor='black')
-        axes[i].set_title(f'{feature} Distribution')
-        axes[i].set_xlabel(feature)
-        axes[i].set_ylabel('Frequency')
-    
-    plt.tight_layout()
-    
-    img_buffer = io.BytesIO()
-    plt.savefig(img_buffer, format='png', dpi=300, bbox_inches='tight')
-    img_buffer.seek(0)
-    images.append(base64.b64encode(img_buffer.getvalue()).decode())
-    plt.close()
-    
-    # 5. Model Performance Metrics
-    from sklearn.metrics import classification_report, confusion_matrix
-    
-    y_pred = model.predict(X_train)
-    
-    plt.figure(figsize=(12, 5))
-    
-    # Confusion Matrix
-    plt.subplot(1, 2, 1)
-    cm = confusion_matrix(y_train, y_pred)
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-    plt.title('Confusion Matrix')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    
-    # Classification Report
-    plt.subplot(1, 2, 2)
-    report = classification_report(y_train, y_pred, output_dict=True)
-    metrics_df = pd.DataFrame(report).transpose()
-    sns.heatmap(metrics_df.iloc[:-3, :-1].astype(float), annot=True, cmap='YlOrRd')
-    plt.title('Classification Metrics')
-    
-    plt.tight_layout()
-    
-    img_buffer = io.BytesIO()
-    plt.savefig(img_buffer, format='png', dpi=300, bbox_inches='tight')
-    img_buffer.seek(0)
-    images.append(base64.b64encode(img_buffer.getvalue()).decode())
-    plt.close()
-    
-    return images
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -4586,14 +4483,14 @@ Image Columns: {', '.join(image_cols[:3]) if image_cols else 'None'}
                 'images': base64_images,  # Include the base64 images
                 'plot_summaries': plot_summaries
             }
-            ai_outputs_url = 'http://ai_outputs:8001/store-results'
+            ai_outputs_url = f'{AI_OUTPUTS_SERVICE_URL}/store-results'
             response = requests.post(ai_outputs_url, json=data_statistics_payload, timeout=10)
             if response.status_code == 200:
-                print(f"Successfully stored data statistics in AI outputs service for user {user_id}")
+                logger.info("Successfully stored data statistics in AI outputs service for user %s", user_id)
             else:
-                print(f"Warning: Failed to store data statistics in AI outputs service: {response.status_code} {response.text}")
+                logger.warning("Failed to store data statistics in AI outputs service: %s %s", response.status_code, response.text)
         except Exception as e:
-            print(f"Warning: Could not store data statistics in AI outputs service: {e}")
+            logger.warning("Could not store data statistics in AI outputs service: %s", e)
         
         print(f"=== DATA STATISTICS SUCCESS ===")
         print(f"Generated {len(base64_images)} visualizations")
@@ -4774,14 +4671,14 @@ def generate_enhanced_attention_analysis(example_text, user_id):
                 }
             }
             
-            ai_outputs_url = 'http://ai_outputs:8001/store-attention-insights'
+            ai_outputs_url = f'{AI_OUTPUTS_SERVICE_URL}/store-attention-insights'
             response = requests.post(ai_outputs_url, json=attention_data, timeout=10)
             if response.status_code == 200:
-                print("Attention insights stored in AI outputs service successfully")
+                logger.info("Attention insights stored in AI outputs service successfully")
             else:
-                print(f"Warning: Failed to store attention insights: {response.status_code}")
+                logger.warning("Failed to store attention insights: %s", response.status_code)
         except Exception as e:
-            print(f"Warning: Could not store attention insights: {e}")
+            logger.warning("Could not store attention insights: %s", e)
         
         print("Enhanced attention analysis completed successfully", flush=True)
         return attention_img, attention_insights
@@ -5639,14 +5536,14 @@ def run_text_xai(df, example_index, user_id, model_type):
             }
             
             # Store in AI outputs service
-            ai_outputs_url = 'http://ai_outputs:8001/store-results'
+            ai_outputs_url = f'{AI_OUTPUTS_SERVICE_URL}/store-results'
             response = requests.post(ai_outputs_url, json=xai_results, timeout=10)
             if response.status_code == 200:
-                print("XAI results stored in AI outputs service successfully")
+                logger.info("XAI results stored in AI outputs service successfully")
             else:
-                print(f"Warning: Failed to store XAI results in AI outputs service: {response.status_code}")
+                logger.warning("Failed to store XAI results in AI outputs service: %s", response.status_code)
         except Exception as e:
-            print(f"Warning: Could not store XAI results in AI outputs service: {e}")
+            logger.warning("Could not store XAI results in AI outputs service: %s", e)
         
         return jsonify({
             'visualizations': visualizations,

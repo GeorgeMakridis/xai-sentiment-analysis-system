@@ -95,17 +95,14 @@
             border: 1px solid #fcc;
         }
         
-        .demo-credentials {
+        .dev-notice {
             margin-top: 1rem;
-            padding: 1rem;
-            background: #f8f9fa;
+            padding: 0.75rem;
+            background: #fffbe6;
             border-radius: 5px;
-            font-size: 0.9rem;
-            color: #666;
-        }
-        
-        .demo-credentials strong {
-            color: #333;
+            font-size: 0.85rem;
+            color: #44546A;
+            border: 1px solid #ffe58f;
         }
     </style>
 </head>
@@ -136,10 +133,8 @@
             <button type="submit" class="login-btn">Sign In</button>
         </form>
         
-        <div class="demo-credentials">
-            <strong>Demo Credentials:</strong><br>
-            Username: admin<br>
-            Password: password123
+        <div class="dev-notice">
+            Development mode. Set <strong>AUTH_MODE=keycloak</strong> in .env for production OIDC authentication.
         </div>
     </div>
 </body>

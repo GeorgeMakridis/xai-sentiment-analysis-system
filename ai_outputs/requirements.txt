@@ -12,3 +12,5 @@ sentence-transformers==2.2.2
 faiss-cpu==1.7.4
 openai>=1.0.0
 minio>=7.2.0
+# Auth (JWT validation for service-to-service calls)
+python-jose[cryptography]>=3.3.0
