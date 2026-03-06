@@ -14,9 +14,8 @@ Buckets
 Every object is stored with user-scoped keys:
     {user_id}/{object_id}.{ext}
 
-RustFS reference: https://rustfs.com
-Docker image:     rustfs/rustfs:latest
-Default creds:    rustfsadmin / rustfsadmin
+Remote instance: https://rustfs.extra-brain.unparallel.pt
+RustFS docs:     https://rustfs.com
 """
 
 import io
@@ -30,10 +29,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration – all overridable via env vars
 # ---------------------------------------------------------------------------
-RESTFS_ENDPOINT = os.environ.get("RESTFS_ENDPOINT", "rustfs:9000")
-RESTFS_ACCESS_KEY = os.environ.get("RESTFS_ACCESS_KEY", "rustfsadmin")
-RESTFS_SECRET_KEY = os.environ.get("RESTFS_SECRET_KEY", "rustfsadmin")
-RESTFS_SECURE = os.environ.get("RESTFS_SECURE", "false").lower() == "true"
+RESTFS_ENDPOINT = os.environ.get("RESTFS_ENDPOINT", "rustfs.extra-brain.unparallel.pt")
+RESTFS_ACCESS_KEY = os.environ.get("RESTFS_ACCESS_KEY", "")
+RESTFS_SECRET_KEY = os.environ.get("RESTFS_SECRET_KEY", "")
+RESTFS_SECURE = os.environ.get("RESTFS_SECURE", "true").lower() == "true"
 RESTFS_REGION = os.environ.get("RESTFS_REGION", "us-east-1")
 
 BUCKET_PLOTS = os.environ.get("RESTFS_BUCKET_PLOTS", "xai-plots")
@@ -54,6 +53,11 @@ def _get_client():
     global _client
     if _client is not None:
         return _client
+
+    if not RESTFS_ACCESS_KEY or not RESTFS_SECRET_KEY:
+        logger.warning("RustFS credentials not set (RESTFS_ACCESS_KEY / RESTFS_SECRET_KEY) – falling back to local FS")
+        return None
+
     try:
         from minio import Minio
         _client = Minio(
@@ -68,7 +72,7 @@ def _get_client():
             if not _client.bucket_exists(bucket):
                 _client.make_bucket(bucket)
                 logger.info("Created bucket %s on RustFS", bucket)
-        logger.info("RustFS client initialised -> %s", RESTFS_ENDPOINT)
+        logger.info("RustFS client initialised -> %s (secure=%s)", RESTFS_ENDPOINT, RESTFS_SECURE)
         return _client
     except Exception as exc:
         logger.warning("RustFS unavailable (%s) – falling back to local FS", exc)

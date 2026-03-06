@@ -1,29 +1,4 @@
 services:
-  # ── RustFS (S3-compatible object storage) ───────────────────────
-  rustfs:
-    image: rustfs/rustfs:latest
-    container_name: rustfs-server
-    ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Web console
-    environment:
-      RUSTFS_ADDRESS: "0.0.0.0:9000"
-      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
-      RUSTFS_CONSOLE_ENABLE: "true"
-      RUSTFS_ACCESS_KEY: ${RESTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RESTFS_SECRET_KEY:-rustfsadmin}
-    volumes:
-      - rustfs_data:/data
-    command: ["/data"]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - app-network
-
   # ── Keycloak (OIDC auth) ───────────────────────────────────────
   keycloak-db:
     image: postgres:15-alpine
@@ -80,17 +55,18 @@ services:
       - "3001:3000"
     volumes:
       - ./shared_volume:/app/shared_data
-      - ./auth:/app/auth:ro        # shared auth module
+      - ./auth:/app/auth:ro
     depends_on:
       - xai_service
       - ai_outputs
-      - rustfs
     environment:
       - XAI_SERVICE_URL=${XAI_SERVICE_URL:-http://xai_service:8000}
       - AI_OUTPUTS_SERVICE_URL=${AI_OUTPUTS_SERVICE_URL:-http://ai_outputs:8001}
-      - RESTFS_ENDPOINT=${RESTFS_ENDPOINT:-rustfs:9000}
-      - RESTFS_ACCESS_KEY=${RESTFS_ACCESS_KEY:-rustfsadmin}
-      - RESTFS_SECRET_KEY=${RESTFS_SECRET_KEY:-rustfsadmin}
+      # Remote RustFS (EXTRA-BRAIN)
+      - RESTFS_ENDPOINT=${RESTFS_ENDPOINT:-rustfs.extra-brain.unparallel.pt}
+      - RESTFS_ACCESS_KEY=${RESTFS_ACCESS_KEY}
+      - RESTFS_SECRET_KEY=${RESTFS_SECRET_KEY}
+      - RESTFS_SECURE=${RESTFS_SECURE:-true}
       - FLASK_SECRET_KEY=${FLASK_SECRET_KEY:-change-me-in-production}
       # Auth — set AUTH_MODE=keycloak to enable OIDC
       - AUTH_MODE=${AUTH_MODE:-legacy}
@@ -119,15 +95,15 @@ services:
     volumes:
       - ./shared_volume:/app/shared_data
       - ./auth:/app/auth:ro
-    depends_on:
-      - rustfs
     environment:
       - AI_OUTPUTS_SERVICE_URL=${AI_OUTPUTS_SERVICE_URL:-http://ai_outputs:8001}
       - AI_ADAPTER_URL=${AI_ADAPTER_URL:-}
       - AI_ADAPTER_TIMEOUT=${AI_ADAPTER_TIMEOUT:-60}
-      - RESTFS_ENDPOINT=${RESTFS_ENDPOINT:-rustfs:9000}
-      - RESTFS_ACCESS_KEY=${RESTFS_ACCESS_KEY:-rustfsadmin}
-      - RESTFS_SECRET_KEY=${RESTFS_SECRET_KEY:-rustfsadmin}
+      # Remote RustFS (EXTRA-BRAIN)
+      - RESTFS_ENDPOINT=${RESTFS_ENDPOINT:-rustfs.extra-brain.unparallel.pt}
+      - RESTFS_ACCESS_KEY=${RESTFS_ACCESS_KEY}
+      - RESTFS_SECRET_KEY=${RESTFS_SECRET_KEY}
+      - RESTFS_SECURE=${RESTFS_SECURE:-true}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - AUTH_MODE=${AUTH_MODE:-legacy}
       - KC_SERVER_URL=${KC_SERVER_URL:-http://keycloak:8080}
@@ -151,13 +127,13 @@ services:
     volumes:
       - ./shared_volume:/app/shared_data
       - ./auth:/app/auth:ro
-    depends_on:
-      - rustfs
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - RESTFS_ENDPOINT=${RESTFS_ENDPOINT:-rustfs:9000}
-      - RESTFS_ACCESS_KEY=${RESTFS_ACCESS_KEY:-rustfsadmin}
-      - RESTFS_SECRET_KEY=${RESTFS_SECRET_KEY:-rustfsadmin}
+      # Remote RustFS (EXTRA-BRAIN)
+      - RESTFS_ENDPOINT=${RESTFS_ENDPOINT:-rustfs.extra-brain.unparallel.pt}
+      - RESTFS_ACCESS_KEY=${RESTFS_ACCESS_KEY}
+      - RESTFS_SECRET_KEY=${RESTFS_SECRET_KEY}
+      - RESTFS_SECURE=${RESTFS_SECURE:-true}
       - AUTH_MODE=${AUTH_MODE:-legacy}
       - KC_SERVER_URL=${KC_SERVER_URL:-http://keycloak:8080}
       - KC_REALM=${KC_REALM:-xai-platform}
@@ -175,7 +151,6 @@ services:
       - app-network
 
 volumes:
-  rustfs_data:
   keycloak_db_data:
 
 networks:
