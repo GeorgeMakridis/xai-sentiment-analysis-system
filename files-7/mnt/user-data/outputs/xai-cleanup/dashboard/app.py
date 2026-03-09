@@ -101,16 +101,6 @@ def upload_data():
         })
         if resp.status_code == 200:
             result = resp.json()
-
-            # Persist dataset to RustFS so it survives container restarts
-            try:
-                _proxy_post(f"{AI_OUTPUTS_SERVICE_URL}/api/store-dataset", {
-                    "user_id": _user_id(),
-                    "filename": filename,
-                }, timeout=30)
-            except Exception as e:
-                logger.warning("Failed to persist dataset to RustFS: %s", e)
-
             return jsonify({
                 "message": "Data uploaded and ingested successfully",
                 "file_path": file_path,
@@ -285,27 +275,11 @@ def list_datasets():
 def select_dataset():
     data = request.json or {}
     filename = data.get("filename")
-    source = data.get("source", "local")
     data_type = data.get("data_type", "text")
     if not filename:
         return jsonify({"error": "No filename provided"}), 400
 
     file_path = os.path.join(UPLOAD_FOLDER, filename)
-
-    # If dataset lives in RustFS but not locally, fetch it first
-    if source == "restfs" and not os.path.exists(file_path):
-        try:
-            fetch_resp = _proxy_post(
-                f"{AI_OUTPUTS_SERVICE_URL}/api/fetch-dataset",
-                {"user_id": _user_id(), "filename": filename},
-                timeout=30,
-            )
-            if fetch_resp.status_code != 200:
-                return jsonify({"error": f"Failed to fetch dataset from RustFS: {fetch_resp.text}"}), 500
-            file_path = fetch_resp.json().get("file_path", file_path)
-        except Exception as e:
-            return jsonify({"error": f"Failed to fetch dataset from RustFS: {e}"}), 500
-
     if not os.path.exists(file_path):
         return jsonify({"error": f"Dataset not found: {filename}"}), 404
 

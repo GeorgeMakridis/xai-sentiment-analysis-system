@@ -12,10 +12,16 @@ from typing import List, Dict, Any, Optional
 import hashlib
 import uuid
 import logging
+import pickle
+from faithfulness_evaluator import FaithfulnessEvaluator
+from test_set_generator import TestSetGenerator
 from plot_metadata_schema import build_plot_metadata, metadata_to_vector_text, metadata_to_vector_meta
 from storage_abstraction import (
+    save_plot_html,
+    load_plot_html,
     load_registry,
     save_registry,
+    delete_plot_file,
     save_plot_image,
     load_plot_image,
     load_plot_image_b64,
@@ -1725,90 +1731,6 @@ def list_user_datasets_restfs(user_id):
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/store-dataset', methods=['POST'])
-def store_dataset_to_restfs():
-    """Persist an uploaded dataset file to RustFS so it survives container restarts.
-    Reads from shared_volume/uploads/{filename} and uploads to xai-datasets/{user_id}/{filename}."""
-    try:
-        data = request.json or {}
-        user_id = data.get('user_id')
-        filename = data.get('filename')
-
-        if not user_id or not filename:
-            return jsonify({'error': 'Missing user_id or filename'}), 400
-
-        file_path = os.path.join(SHARED_DATA_DIR, 'uploads', filename)
-        if not os.path.isfile(file_path):
-            return jsonify({'error': f'File not found: {filename}'}), 404
-
-        with open(file_path, 'rb') as f:
-            file_bytes = f.read()
-
-        # Determine content type from extension
-        ext = os.path.splitext(filename)[1].lower()
-        content_type = {
-            '.csv': 'text/csv',
-            '.json': 'application/json',
-            '.txt': 'text/plain',
-        }.get(ext, 'application/octet-stream')
-
-        import restfs_client as _restfs
-        if not _restfs.is_available():
-            return jsonify({'error': 'RustFS not available'}), 503
-
-        key = _restfs.save_dataset(file_bytes, user_id, filename, content_type)
-        if not key:
-            return jsonify({'error': 'Failed to upload to RustFS'}), 500
-
-        logger.info("Dataset %s stored in RustFS for user %s (%d bytes)", filename, user_id, len(file_bytes))
-        return jsonify({
-            'message': f'Dataset stored in RustFS',
-            'key': key,
-            'size': len(file_bytes),
-        })
-    except Exception as e:
-        logger.exception('store_dataset_to_restfs failed')
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/fetch-dataset', methods=['POST'])
-def fetch_dataset_from_restfs():
-    """Download a dataset from RustFS to shared_volume/uploads/ so xai_service can ingest it.
-    Used when user selects a RustFS-only dataset."""
-    try:
-        data = request.json or {}
-        user_id = data.get('user_id')
-        filename = data.get('filename')
-
-        if not user_id or not filename:
-            return jsonify({'error': 'Missing user_id or filename'}), 400
-
-        import restfs_client as _restfs
-        if not _restfs.is_available():
-            return jsonify({'error': 'RustFS not available'}), 503
-
-        file_bytes = _restfs.get_dataset(user_id, filename)
-        if file_bytes is None:
-            return jsonify({'error': f'Dataset not found in RustFS: {filename}'}), 404
-
-        # Save to shared uploads so xai_service can access it
-        uploads_dir = os.path.join(SHARED_DATA_DIR, 'uploads')
-        os.makedirs(uploads_dir, exist_ok=True)
-        file_path = os.path.join(uploads_dir, filename)
-        with open(file_path, 'wb') as f:
-            f.write(file_bytes)
-
-        logger.info("Dataset %s fetched from RustFS to %s (%d bytes)", filename, file_path, len(file_bytes))
-        return jsonify({
-            'message': f'Dataset fetched from RustFS',
-            'file_path': file_path,
-            'size': len(file_bytes),
-        })
-    except Exception as e:
-        logger.exception('fetch_dataset_from_restfs failed')
-        return jsonify({'error': str(e)}), 500
-
-
 @app.route('/store-data', methods=['POST'])
 def store_data():
     """Store user data information"""
@@ -1842,6 +1764,221 @@ def store_data():
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/store-interactive-plot', methods=['POST'])
+def store_interactive_plot():
+    """Store interactive plot metadata for chat grounding and plot registry"""
+    try:
+        data = request.json or {}
+        user_id = data.get('user_id')
+        plot_data = data.get('plot_data', {})
+        query = data.get('query', '')
+
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+
+        plot_type = plot_data.get('plot_type', 'interactive')
+        metadata = plot_data.get('metadata', {})
+        plot_spec = metadata.get('plot_spec', {})
+        plot_summary = metadata.get('plot_summary', {})
+        plot_html = plot_data.get('plot_html', '')
+        dataset_id = data.get('dataset_id', '')
+        file_path = data.get('file_path', '')
+        file_name = data.get('file_name', '')
+        data_mode = data.get('data_mode', metadata.get('data_mode', 'image'))
+        tags = data.get('tags') or []
+
+        # Build full metadata for registry
+        meta = build_plot_metadata(
+            user_id=user_id,
+            plot_type=plot_type,
+            query=query,
+            plot_spec=plot_spec,
+            plot_summary=plot_summary,
+            plot_html=plot_html,
+            dataset_id=dataset_id,
+            file_path=file_path,
+            file_name=file_name,
+            data_mode=data_mode,
+            tags=tags,
+        )
+
+        # Save plot HTML to disk and set path in metadata
+        if plot_html:
+            html_path = save_plot_html(plot_html, user_id, meta['plot_id'])
+            meta['plot_html_path'] = html_path
+
+        # Append to user's plot registry
+        plots = load_registry(user_id)
+        plots.append(meta)
+        save_registry(user_id, plots)
+
+        # RAG: Store as interactive_plot document
+        doc = f"Interactive Plot Request: {query}. Plot type: {plot_type}. "
+        if plot_spec:
+            doc += f"Plot spec: {json.dumps(plot_spec, default=str)}. "
+        if plot_summary:
+            summary_data = plot_summary.get('data', {})
+            if summary_data:
+                doc += f"Data: {json.dumps(summary_data, default=str)}. "
+            if plot_summary.get('summary_text'):
+                doc += f"Summary: {plot_summary.get('summary_text')}. "
+        if metadata:
+            doc += f"Metadata: {json.dumps(metadata, default=str)}."
+
+        vector_db.add_document(
+            user_id,
+            doc,
+            {
+                'doc_type': 'interactive_plot',
+                'plot_type': plot_type,
+                'query': query,
+                'plot_spec': plot_spec,
+                'plot_summary': plot_summary,
+                'plot_id': meta['plot_id'],
+                'timestamp': datetime.now().isoformat()
+            }
+        )
+
+        if plot_summary and isinstance(plot_summary, dict):
+            title = plot_summary.get('title', f'Interactive Plot: {query}')
+            plot_type_from_summary = plot_summary.get('plot_type', plot_type)
+            description = plot_summary.get('description', '')
+            summary_data = plot_summary.get('data', {})
+            summary_text = plot_summary.get('summary_text', '')
+            summary_doc = f"{title}. Plot type: {plot_type_from_summary}. "
+            if description:
+                summary_doc += f"Description: {description}. "
+            if summary_text:
+                summary_doc += f"Summary: {summary_text}. "
+            if summary_data:
+                summary_doc += f"Data: {json.dumps(summary_data, default=str)}. "
+            vector_db.add_document(
+                user_id,
+                summary_doc,
+                {
+                    'doc_type': 'plot_summary',
+                    'plot_type': plot_type_from_summary,
+                    'source': 'interactive_plot',
+                    'title': title,
+                    'description': description,
+                    'data': summary_data,
+                    'summary_text': summary_text,
+                    'query': query,
+                    'timestamp': datetime.now().isoformat()
+                }
+            )
+
+        return jsonify({
+            'message': 'Interactive plot stored successfully',
+            'plot_id': meta['plot_id']
+        })
+    except Exception as e:
+        logger.exception('store_interactive_plot failed')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/plots', methods=['GET'])
+def list_plots():
+    """List saved plots for a user with optional filters."""
+    try:
+        user_id = request.args.get('user_id')
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+        dataset_id = request.args.get('dataset_id', '')
+        plot_type = request.args.get('plot_type', '')
+        limit = min(int(request.args.get('limit', 100)), 500)
+        offset = max(0, int(request.args.get('offset', 0)))
+
+        plots = load_registry(user_id)
+        if dataset_id:
+            plots = [p for p in plots if p.get('dataset_id') == dataset_id]
+        if plot_type:
+            plots = [p for p in plots if p.get('plot_type') == plot_type]
+        total = len(plots)
+        plots = plots[offset:offset + limit]
+        return jsonify({'plots': plots, 'total': total, 'limit': limit, 'offset': offset})
+    except Exception as e:
+        logger.exception('list_plots failed')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/plots/<plot_id>', methods=['GET'])
+def get_plot(plot_id):
+    """Get metadata for a single plot."""
+    try:
+        user_id = request.args.get('user_id')
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+        plots = load_registry(user_id)
+        for p in plots:
+            if p.get('plot_id') == plot_id:
+                return jsonify(p)
+        return jsonify({'error': 'Plot not found'}), 404
+    except Exception as e:
+        logger.exception('get_plot failed')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/plots/<plot_id>/html', methods=['GET'])
+def get_plot_html(plot_id):
+    """Get plot HTML content."""
+    try:
+        user_id = request.args.get('user_id')
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+        plots = load_registry(user_id)
+        for p in plots:
+            if p.get('plot_id') == plot_id:
+                path = p.get('plot_html_path', '')
+                loc = p.get('storage_location', '')
+                html = load_plot_html(loc, path)
+                if html is not None:
+                    return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
+                return jsonify({'error': 'Plot HTML not available'}), 404
+        return jsonify({'error': 'Plot not found'}), 404
+    except Exception as e:
+        logger.exception('get_plot_html failed')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/plots/<plot_id>', methods=['DELETE'])
+def delete_plot(plot_id):
+    """Delete a saved plot."""
+    try:
+        user_id = request.args.get('user_id')
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+        plots = load_registry(user_id)
+        for i, p in enumerate(plots):
+            if p.get('plot_id') == plot_id:
+                delete_plot_file(p.get('plot_html_path', ''))
+                plots.pop(i)
+                save_registry(user_id, plots)
+                return jsonify({'message': 'Plot deleted'})
+        return jsonify({'error': 'Plot not found'}), 404
+    except Exception as e:
+        logger.exception('delete_plot failed')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/datasets/<user_id>', methods=['GET'])
+def list_datasets(user_id):
+    """List datasets (unique file_name/dataset_id) for a user with plot counts."""
+    try:
+        plots = load_registry(user_id)
+        seen = {}
+        for p in plots:
+            did = p.get('dataset_id') or p.get('file_name') or 'unknown'
+            name = p.get('file_name') or did
+            if did not in seen:
+                seen[did] = {'dataset_id': did, 'file_name': name, 'plot_count': 0}
+            seen[did]['plot_count'] += 1
+        return jsonify({'datasets': list(seen.values())})
+    except Exception as e:
+        logger.exception('list_datasets failed')
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/store-results', methods=['POST'])
 def store_results():
@@ -1980,6 +2117,179 @@ def chat():
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/clear-user-data/<user_id>', methods=['DELETE'])
+def clear_user_data(user_id):
+    """Clear all data for a specific user"""
+    try:
+        if user_id in vector_db.collections:
+            del vector_db.collections[user_id]
+        if user_id in conversation_history:
+            del conversation_history[user_id]
+        return jsonify({'message': f'All data cleared for user {user_id}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/evaluate-faithfulness', methods=['POST'])
+def evaluate_faithfulness():
+    """
+    Evaluate faithfulness of RAG responses on test set
+    
+    Request body:
+    {
+        "user_id": "admin",
+        "test_set_path": "ai_outputs/test_set.json" (optional)
+    }
+    
+    Returns:
+    {
+        "constrained_prompt": {
+            "grounding_percentage": 0.85,
+            "hallucination_rate": 0.08,
+            "avg_citations_per_response": 2.3,
+            "feature_overlap": 0.78
+        },
+        "naive_prompt": {
+            "grounding_percentage": 0.45,
+            "hallucination_rate": 0.35,
+            "avg_citations_per_response": 0.2,
+            "feature_overlap": 0.42
+        },
+        "improvement": {
+            "grounding_delta": 0.40,
+            "hallucination_reduction": 0.27
+        }
+    }
+    """
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        test_set_path = data.get('test_set_path', 'ai_outputs/test_set.json')
+        
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+        
+        # Check if user has stored results
+        if user_id not in vector_db.collections:
+            return jsonify({'error': 'No results found for user. Please upload and analyze a model first.'}), 404
+        
+        # Initialize evaluator and test set generator
+        evaluator = FaithfulnessEvaluator()
+        test_set_gen = TestSetGenerator()
+        
+        # Load or create test set
+        if os.path.exists(test_set_path):
+            test_cases = test_set_gen.load_test_set(test_set_path)
+        else:
+            # Try to create test set from user's stored XAI artifacts
+            # Search for XAI analysis documents
+            all_docs = []
+            if user_id in vector_db.collections:
+                for text, meta in zip(vector_db.collections[user_id]['documents'], 
+                                    vector_db.collections[user_id]['metadata']):
+                    all_docs.append({'text': text, 'metadata': meta})
+            
+            # Extract XAI artifacts from stored documents
+            xai_docs = [doc for doc in all_docs if doc.get('metadata', {}).get('doc_type') == 'xai_analysis']
+            
+            if not xai_docs:
+                return jsonify({'error': 'No XAI analysis results found. Please run XAI analysis first.'}), 404
+            
+            # Get the most recent XAI analysis
+            latest_xai = xai_docs[-1]
+            metadata = latest_xai.get('metadata', {})
+            
+            lime_features = metadata.get('lime_features', [])
+            attention_tokens = metadata.get('attention_tokens', [])
+            confidence_score = metadata.get('confidence_score')
+            example_text = metadata.get('example_text', '')
+            
+            if not lime_features and not attention_tokens:
+                return jsonify({'error': 'XAI artifacts not found in stored results. Please run XAI analysis first.'}), 404
+            
+            # Create test set from artifacts
+            test_cases = test_set_gen.create_test_set_from_artifacts(
+                lime_features, attention_tokens, confidence_score or 0.0, example_text
+            )
+            
+            # Save test set for future use
+            os.makedirs(os.path.dirname(test_set_path) if os.path.dirname(test_set_path) else '.', exist_ok=True)
+            test_set_gen.save_test_set(test_cases, test_set_path)
+        
+        if not test_cases:
+            return jsonify({'error': 'Test set is empty'}), 404
+        
+        # Run evaluation
+        constrained_results = []
+        naive_results = []
+        
+        for test_case in test_cases:
+            prompt = test_case['prompt']
+            
+            # Extract expected artifacts
+            expected_artifacts = {
+                'expected_features': test_case.get('expected_features', []),
+                'expected_tokens': test_case.get('expected_tokens', []),
+                'expected_values': test_case.get('expected_values', {})
+            }
+            
+            # Generate constrained response
+            constrained_response = generate_rag_response(prompt, user_id, use_constrained=True)
+            constrained_eval = evaluator.evaluate_response(constrained_response, expected_artifacts)
+            constrained_results.append(constrained_eval)
+            
+            # Generate naive response
+            naive_response = generate_naive_rag_response(prompt, user_id)
+            naive_eval = evaluator.evaluate_response(naive_response, expected_artifacts)
+            naive_results.append(naive_eval)
+        
+        # Aggregate metrics
+        def aggregate_metrics(eval_results):
+            total = len(eval_results)
+            if total == 0:
+                return {}
+            
+            grounded_count = sum(1 for r in eval_results if r.get('overall_grounded', False))
+            hallucination_count = sum(1 for r in eval_results if r.get('hallucinations', {}).get('has_hallucinations', False))
+            total_citations = sum(r.get('citations', {}).get('citation_count', 0) for r in eval_results)
+            
+            # Feature overlap (average)
+            feature_overlaps = [r.get('feature_overlap', 0.0) for r in eval_results if r.get('feature_overlap', 0.0) > 0]
+            avg_feature_overlap = sum(feature_overlaps) / len(feature_overlaps) if feature_overlaps else 0.0
+            
+            return {
+                'grounding_percentage': grounded_count / total,
+                'hallucination_rate': hallucination_count / total,
+                'avg_citations_per_response': total_citations / total,
+                'feature_overlap': avg_feature_overlap,
+                'total_responses': total
+            }
+        
+        constrained_metrics = aggregate_metrics(constrained_results)
+        naive_metrics = aggregate_metrics(naive_results)
+        
+        # Calculate improvement
+        improvement = {
+            'grounding_delta': constrained_metrics.get('grounding_percentage', 0.0) - naive_metrics.get('grounding_percentage', 0.0),
+            'hallucination_reduction': naive_metrics.get('hallucination_rate', 0.0) - constrained_metrics.get('hallucination_rate', 0.0),
+            'citation_improvement': constrained_metrics.get('avg_citations_per_response', 0.0) - naive_metrics.get('avg_citations_per_response', 0.0),
+            'feature_overlap_improvement': constrained_metrics.get('feature_overlap', 0.0) - naive_metrics.get('feature_overlap', 0.0)
+        }
+        
+        return jsonify({
+            'constrained_prompt': constrained_metrics,
+            'naive_prompt': naive_metrics,
+            'improvement': improvement,
+            'test_set_size': len(test_cases),
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/rehydrate/<user_id>', methods=['POST'])
 def rehydrate_user(user_id):

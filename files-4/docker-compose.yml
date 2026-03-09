@@ -1,0 +1,158 @@
+services:
+  # ── Keycloak (OIDC auth) ───────────────────────────────────────
+  keycloak-db:
+    image: postgres:15-alpine
+    container_name: keycloak-db
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${KC_DB_PASSWORD:-keycloak}
+    volumes:
+      - keycloak_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - app-network
+    profiles:
+      - keycloak
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: keycloak
+    command: start-dev
+    ports:
+      - "8080:8080"
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD:-keycloak}
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      KEYCLOAK_ADMIN: ${KC_ADMIN_USER:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD:-admin}
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && cat <&3 | grep -q 'UP'"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - app-network
+    profiles:
+      - keycloak
+
+  # ── Dashboard ───────────────────────────────────────────────────
+  dashboard:
+    build: ./dashboard
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./shared_volume:/app/shared_data
+      - ./auth:/app/auth:ro
+    depends_on:
+      - xai_service
+      - ai_outputs
+    environment:
+      - XAI_SERVICE_URL=${XAI_SERVICE_URL:-http://xai_service:8000}
+      - AI_OUTPUTS_SERVICE_URL=${AI_OUTPUTS_SERVICE_URL:-http://ai_outputs:8001}
+      # Remote RustFS (EXTRA-BRAIN)
+      - RESTFS_ENDPOINT=${RESTFS_ENDPOINT:-rustfs.extra-brain.unparallel.pt}
+      - RESTFS_ACCESS_KEY=${RESTFS_ACCESS_KEY}
+      - RESTFS_SECRET_KEY=${RESTFS_SECRET_KEY}
+      - RESTFS_SECURE=${RESTFS_SECURE:-true}
+      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY:-change-me-in-production}
+      # Auth
+      - AUTH_MODE=${AUTH_MODE:-legacy}
+      - KC_SERVER_URL=${KC_SERVER_URL:-http://keycloak:8080}
+      - KC_EXTERNAL_URL=${KC_EXTERNAL_URL:-http://localhost:8080}
+      - KC_REALM=${KC_REALM:-xai-platform}
+      - KC_CLIENT_ID=${KC_CLIENT_ID:-xai-dashboard}
+      - KC_CLIENT_SECRET=${KC_CLIENT_SECRET:-}
+      - LEGACY_ADMIN_PW=${LEGACY_ADMIN_PW:-changeme}
+      - LEGACY_ANALYST_PW=${LEGACY_ANALYST_PW:-changeme}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
+
+  # ── XAI Service ─────────────────────────────────────────────────
+  xai_service:
+    build: ./xai_service
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./shared_volume:/app/shared_data
+      - ./auth:/app/auth:ro
+    environment:
+      - AI_OUTPUTS_SERVICE_URL=${AI_OUTPUTS_SERVICE_URL:-http://ai_outputs:8001}
+      - AI_ADAPTER_URL=${AI_ADAPTER_URL:-}
+      - AI_ADAPTER_TIMEOUT=${AI_ADAPTER_TIMEOUT:-60}
+      # Remote RustFS (EXTRA-BRAIN)
+      - RESTFS_ENDPOINT=${RESTFS_ENDPOINT:-rustfs.extra-brain.unparallel.pt}
+      - RESTFS_ACCESS_KEY=${RESTFS_ACCESS_KEY}
+      - RESTFS_SECRET_KEY=${RESTFS_SECRET_KEY}
+      - RESTFS_SECURE=${RESTFS_SECURE:-true}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - AUTH_MODE=${AUTH_MODE:-legacy}
+      - KC_SERVER_URL=${KC_SERVER_URL:-http://keycloak:8080}
+      - KC_REALM=${KC_REALM:-xai-platform}
+      - KC_CLIENT_ID=${KC_CLIENT_ID:-xai-dashboard}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
+
+  # ── AI Outputs (RAG + Chat) ────────────────────────────────────
+  ai_outputs:
+    build: ./ai_outputs
+    ports:
+      - "8002:8001"
+    volumes:
+      - ./shared_volume:/app/shared_data
+      - ./auth:/app/auth:ro
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # Remote RustFS (EXTRA-BRAIN)
+      - RESTFS_ENDPOINT=${RESTFS_ENDPOINT:-rustfs.extra-brain.unparallel.pt}
+      - RESTFS_ACCESS_KEY=${RESTFS_ACCESS_KEY}
+      - RESTFS_SECRET_KEY=${RESTFS_SECRET_KEY}
+      - RESTFS_SECURE=${RESTFS_SECURE:-true}
+      - AUTH_MODE=${AUTH_MODE:-legacy}
+      - KC_SERVER_URL=${KC_SERVER_URL:-http://keycloak:8080}
+      - KC_REALM=${KC_REALM:-xai-platform}
+      - KC_CLIENT_ID=${KC_CLIENT_ID:-xai-dashboard}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MAX_FILE_SIZE=${MAX_FILE_SIZE:-10485760}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
+
+volumes:
+  keycloak_db_data:
+
+networks:
+  app-network:
+    driver: bridge

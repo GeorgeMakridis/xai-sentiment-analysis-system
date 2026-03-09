@@ -101,16 +101,6 @@ def upload_data():
         })
         if resp.status_code == 200:
             result = resp.json()
-
-            # Persist dataset to RustFS so it survives container restarts
-            try:
-                _proxy_post(f"{AI_OUTPUTS_SERVICE_URL}/api/store-dataset", {
-                    "user_id": _user_id(),
-                    "filename": filename,
-                }, timeout=30)
-            except Exception as e:
-                logger.warning("Failed to persist dataset to RustFS: %s", e)
-
             return jsonify({
                 "message": "Data uploaded and ingested successfully",
                 "file_path": file_path,
@@ -121,6 +111,80 @@ def upload_data():
         logger.exception("upload_data failed")
         return jsonify({"error": f"Ingestion failed: {e}"}), 500
 
+
+@app.route("/api/upload-model", methods=["POST"])
+@login_required
+@role_required("analyst", "admin")
+def upload_model():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+
+    filename = secure_filename(file.filename)
+    file_path = os.path.join(MODELS_FOLDER, filename)
+    file.save(file_path)
+
+    try:
+        resp = _proxy_post(f"{XAI_SERVICE_URL}/analyze", {
+            "model_path": file_path,
+            "user_id": _user_id(),
+        })
+        if resp.status_code != 200:
+            return jsonify({"error": "Analysis failed"}), 500
+
+        result_data = resp.json()
+
+        # Store in AI outputs for RAG
+        try:
+            _proxy_post(f"{AI_OUTPUTS_SERVICE_URL}/store-results", {
+                "user_id": _user_id(),
+                "results": result_data,
+            }, timeout=15)
+        except Exception as e:
+            logger.warning("Failed to store results in AI outputs: %s", e)
+
+        return jsonify({"message": "Model uploaded and analysis completed",
+                        "results": result_data})
+    except Exception as e:
+        logger.exception("upload_model failed")
+        return jsonify({"error": f"Analysis failed: {e}"}), 500
+
+
+# ── Results retrieval ────────────────────────────────────────────────────────
+
+@app.route("/api/get-results")
+@login_required
+def get_results():
+    try:
+        resp = _proxy_get(f"{AI_OUTPUTS_SERVICE_URL}/results/{_user_id()}")
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("images"):
+                return jsonify(data)
+    except Exception as e:
+        logger.warning("AI outputs results unavailable: %s", e)
+
+    # Fallback: local result files
+    try:
+        results_dir = os.path.join(SHARED_DATA_DIR, "results")
+        if os.path.isdir(results_dir):
+            user_files = sorted(
+                [f for f in os.listdir(results_dir)
+                 if f.endswith(".json") and _user_id() in f]
+            )
+            if user_files:
+                with open(os.path.join(results_dir, user_files[-1])) as fh:
+                    return jsonify(json.load(fh))
+    except Exception as e:
+        logger.warning("Local results fallback failed: %s", e)
+
+    return jsonify({"message": "No results found. Upload and analyse data first."})
+
+
+# ── Chat ─────────────────────────────────────────────────────────────────────
 
 @app.route("/api/chat", methods=["POST"])
 @login_required
@@ -143,6 +207,64 @@ def chat():
         return jsonify({"error": f"Chat failed: {e}"}), 500
 
 
+# ── Model training ───────────────────────────────────────────────────────────
+
+@app.route("/api/create-sp100-model", methods=["POST"])
+@login_required
+@role_required("analyst", "admin")
+def create_sp100_model():
+    data = request.json or {}
+    model_type = data.get("model_type")
+    if not model_type:
+        return jsonify({"error": "No model type provided"}), 400
+
+    sp100_path = os.path.join(SHARED_DATA_DIR, "uploads", "sp100_daily_prices.csv")
+    if not os.path.exists(sp100_path):
+        return jsonify({"error": "SP100 data not found"}), 404
+
+    try:
+        resp = _proxy_post(f"{XAI_SERVICE_URL}/create-model", {
+            "data_path": sp100_path,
+            "model_type": model_type,
+            "user_id": _user_id(),
+        })
+        if resp.status_code == 200:
+            return jsonify({
+                "message": f"SP100 {model_type.replace('_', ' ').title()} model created",
+                "results": resp.json(),
+            })
+        return jsonify({"error": "Model creation failed"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Model creation failed: {e}"}), 500
+
+
+@app.route("/api/train-model", methods=["POST"])
+@login_required
+@role_required("analyst", "admin")
+def train_model():
+    data = request.json or {}
+    model_type = data.get("model_type")
+    data_type = data.get("data_type")
+    if not model_type or not data_type:
+        return jsonify({"error": "Missing model_type or data_type"}), 400
+
+    try:
+        resp = _proxy_post(f"{XAI_SERVICE_URL}/train-model", {
+            "model_type": model_type,
+            "data_type": data_type,
+            "user_id": _user_id(),
+        })
+        if resp.status_code == 200:
+            return jsonify({
+                "message": f"{model_type.replace('_', ' ').title()} model trained",
+                "results": resp.json(),
+            })
+        return jsonify({"error": "Model training failed"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Model training failed: {e}"}), 500
+
+
+# ── Data statistics (plot generation) ────────────────────────────────────────
 
 @app.route("/api/data-statistics", methods=["POST"])
 @login_required
@@ -285,27 +407,11 @@ def list_datasets():
 def select_dataset():
     data = request.json or {}
     filename = data.get("filename")
-    source = data.get("source", "local")
     data_type = data.get("data_type", "text")
     if not filename:
         return jsonify({"error": "No filename provided"}), 400
 
     file_path = os.path.join(UPLOAD_FOLDER, filename)
-
-    # If dataset lives in RustFS but not locally, fetch it first
-    if source == "restfs" and not os.path.exists(file_path):
-        try:
-            fetch_resp = _proxy_post(
-                f"{AI_OUTPUTS_SERVICE_URL}/api/fetch-dataset",
-                {"user_id": _user_id(), "filename": filename},
-                timeout=30,
-            )
-            if fetch_resp.status_code != 200:
-                return jsonify({"error": f"Failed to fetch dataset from RustFS: {fetch_resp.text}"}), 500
-            file_path = fetch_resp.json().get("file_path", file_path)
-        except Exception as e:
-            return jsonify({"error": f"Failed to fetch dataset from RustFS: {e}"}), 500
-
     if not os.path.exists(file_path):
         return jsonify({"error": f"Dataset not found: {filename}"}), 404
 
@@ -326,6 +432,85 @@ def select_dataset():
     except Exception as e:
         return jsonify({"error": f"Ingestion failed: {e}"}), 500
 
+
+# ── Preprocessing ────────────────────────────────────────────────────────────
+
+@app.route("/api/preprocess-data", methods=["POST"])
+@login_required
+@role_required("analyst", "admin")
+def preprocess_data():
+    data = request.json or {}
+    data["user_id"] = _user_id()
+    try:
+        resp = _proxy_post(f"{XAI_SERVICE_URL}/preprocess-data", data)
+        if resp.status_code == 200:
+            return jsonify({"message": "Data preprocessed successfully",
+                            "preprocessed_data": resp.json()})
+        return jsonify({"error": "Data preprocessing failed"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Data preprocessing failed: {e}"}), 500
+
+
+# ── Enhanced XAI ─────────────────────────────────────────────────────────────
+
+@app.route("/api/enhanced-xai", methods=["POST"])
+@login_required
+@role_required("analyst", "admin")
+def enhanced_xai():
+    data = request.json or {}
+    data.setdefault("user_id", _user_id())
+    if not data.get("model_path") or not data.get("data_path"):
+        return jsonify({"error": "Missing model_path or data_path"}), 400
+    try:
+        resp = _proxy_post(f"{XAI_SERVICE_URL}/enhanced-xai", data)
+        if resp.status_code == 200:
+            return jsonify(resp.json())
+        return jsonify({"error": "Enhanced XAI analysis failed"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Enhanced XAI analysis failed: {e}"}), 500
+
+
+# ── FinBERT download ─────────────────────────────────────────────────────────
+
+@app.route("/api/download-finbert", methods=["POST"])
+@login_required
+@role_required("analyst", "admin")
+def download_finbert():
+    try:
+        resp = _proxy_post(f"{XAI_SERVICE_URL}/download-finbert", {
+            "user_id": _user_id(),
+        })
+        if resp.status_code == 200:
+            return jsonify({"message": "FinBERT model downloaded successfully",
+                            "model_info": resp.json().get("model_info", {})})
+        return jsonify({"error": "FinBERT download failed"}), 500
+    except Exception as e:
+        return jsonify({"error": f"FinBERT download failed: {e}"}), 500
+
+
+# ── MNIST download ───────────────────────────────────────────────────────────
+
+@app.route("/api/download-mnist", methods=["POST"])
+@login_required
+@role_required("analyst", "admin")
+def download_mnist():
+    data = request.json or {}
+    try:
+        resp = _proxy_post(f"{XAI_SERVICE_URL}/download-mnist", {
+            "user_id": _user_id(),
+            "sample_size": data.get("sample_size", 1000),
+        }, timeout=300)
+        if resp.status_code == 200:
+            return jsonify(resp.json())
+        error_data = resp.json() if resp.content else {}
+        return jsonify({"error": error_data.get("error", "MNIST download failed")}), resp.status_code
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "MNIST download timed out. Try a smaller sample size."}), 504
+    except Exception as e:
+        return jsonify({"error": f"MNIST download failed: {e}"}), 500
+
+
+# ── Health ───────────────────────────────────────────────────────────────────
 
 @app.route("/health")
 def health():

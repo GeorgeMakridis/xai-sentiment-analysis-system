@@ -74,106 +74,6 @@ class CustomJSONEncoder(json.JSONEncoder):
             return obj.values.tolist()
         return super().default(obj)
 
-def preprocess_timeseries_data(df):
-    """Preprocess timeseries data: sort by date, extract features, create lags and rolling stats.
-    Returns (processed_df, target_column)."""
-    df = df.copy()
-
-    # Detect date column
-    date_col = None
-    for col in df.columns:
-        if col.lower() in ('date', 'datetime', 'timestamp', 'time'):
-            date_col = col
-            break
-    if date_col is None:
-        for col in df.columns:
-            try:
-                pd.to_datetime(df[col].head(20))
-                date_col = col
-                break
-            except Exception:
-                continue
-
-    if date_col:
-        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-        df = df.sort_values(date_col).reset_index(drop=True)
-        df['year'] = df[date_col].dt.year
-        df['month'] = df[date_col].dt.month
-        df['day'] = df[date_col].dt.day
-        df['day_of_week'] = df[date_col].dt.dayofweek
-
-    # Detect target column
-    target_column = None
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    for candidate in ('close', 'Close', 'price', 'Price', 'value', 'Value',
-                       'target', 'Target', 'y'):
-        if candidate in numeric_cols:
-            target_column = candidate
-            break
-    if target_column is None and numeric_cols:
-        target_column = numeric_cols[-1]
-
-    # Create lag and rolling features for the target
-    if target_column:
-        for lag in (1, 3, 7):
-            df[f'{target_column}_lag_{lag}'] = df[target_column].shift(lag)
-        for window in (7, 14, 30):
-            df[f'{target_column}_roll_mean_{window}'] = df[target_column].rolling(window).mean()
-            df[f'{target_column}_roll_std_{window}'] = df[target_column].rolling(window).std()
-        df = df.dropna().reset_index(drop=True)
-
-    return df, target_column
-
-
-def load_news_sentiment_data(file_path):
-    """Load and process news sentiment JSON data extracting title, asset (symbol), and sentiment."""
-    try:
-        with open(file_path, 'r') as f:
-            data = json.load(f)
-
-        records = []
-        for date, companies in data.items():
-            for company, articles in companies.items():
-                for article in articles:
-                    try:
-                        title = article.get('title', '')
-                        sentiment = article.get('sentiment', 0.0)
-                        symbols = article.get('symbols', [])
-                        asset = symbols[0] if symbols else company
-                        records.append({
-                            'title': title,
-                            'asset': asset,
-                            'sentiment': sentiment,
-                        })
-                    except Exception as e:
-                        print(f"Warning: Skipping article due to error: {e}")
-                        continue
-
-        df = pd.DataFrame(records)
-        df['title'] = df['title'].str.replace(r'[^\w\s\.,!?-]', ' ', regex=True)
-        df['title'] = df['title'].str.replace(r'\s+', ' ', regex=True)
-        df['title'] = df['title'].str.strip()
-
-        def categorize_sentiment(score):
-            if score > 0.1:
-                return 'positive'
-            elif score < -0.1:
-                return 'negative'
-            return 'neutral'
-
-        df['sentiment_label'] = df['sentiment'].apply(categorize_sentiment)
-        df = df.dropna(subset=['title'])
-        df = df[df['title'].str.len() > 5]
-
-        print(f"Loaded {len(df)} news articles with title, asset, and sentiment")
-        print(f"Sentiment distribution: {df['sentiment_label'].value_counts().to_dict()}")
-        print(f"Assets analyzed: {df['asset'].nunique()}")
-        return df
-
-    except Exception as e:
-        raise Exception(f"Error loading news sentiment data: {str(e)}")
-
-
 def load_data(file_path):
     """Load data from various file formats"""
     try:
@@ -185,6 +85,10 @@ def load_data(file_path):
                 return load_news_sentiment_data(file_path)
             else:
                 return pd.read_json(file_path)
+        elif file_path.endswith('.xlsx'):
+            return pd.read_excel(file_path)
+        elif file_path.endswith('.parquet'):
+            return pd.read_parquet(file_path)
         else:
             raise ValueError(f"Unsupported file format: {file_path}")
     except Exception as e:
