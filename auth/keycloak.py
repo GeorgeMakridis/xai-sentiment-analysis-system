@@ -18,6 +18,12 @@ KC_REALM             = xai-platform
 KC_CLIENT_ID         = xai-dashboard
 KC_CLIENT_SECRET     = <from Keycloak admin console>
 KC_EXTERNAL_URL      = http://localhost:8080  (browser-reachable URL)
+PUBLIC_BASE_URL      = optional https://dashboard.example.com  (OAuth redirect_uri; see below)
+PREFERRED_URL_SCHEME = set on Flask app in dashboard (http | https); works with ProxyFix
+
+Behind HTTPS, the dashboard uses werkzeug ProxyFix plus PREFERRED_URL_SCHEME so
+url_for(..., _external=True) sees the public scheme. If the proxy does not send
+trusted X-Forwarded-* headers, set PUBLIC_BASE_URL to the dashboard origin.
 
 Roles
 -----
@@ -78,6 +84,21 @@ def _certs_url() -> str:
     return f"{_realm_url()}/protocol/openid-connect/certs"
 
 
+def _oauth_redirect_url(endpoint: str) -> str:
+    """
+    Absolute URL for OIDC redirect_uri and post_logout_redirect_uri.
+
+    If PUBLIC_BASE_URL is set, use it as the origin (when the proxy does not
+    send trusted forwarded headers). Otherwise url_for(..., _external=True),
+    which respects ProxyFix + PREFERRED_URL_SCHEME on the dashboard app.
+    """
+    path = url_for(endpoint, _external=False)
+    base = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if base:
+        return f"{base}{path}"
+    return url_for(endpoint, _external=True)
+
+
 # ─── Initialisation ─────────────────────────────────────────────────────────
 
 def init_auth(app: Flask) -> None:
@@ -90,6 +111,9 @@ def init_auth(app: Flask) -> None:
     app.config.setdefault("SESSION_COOKIE_SAMESITE", "Lax")
 
     if AUTH_MODE == "keycloak":
+        pub = os.environ.get("PUBLIC_BASE_URL", "").strip()
+        if pub:
+            logger.info("PUBLIC_BASE_URL set for OAuth redirects: %s", pub)
         _init_keycloak(app)
         logger.info("Auth mode: Keycloak OIDC  (realm=%s, client=%s)",
                      KC_REALM, KC_CLIENT_ID)
@@ -122,7 +146,7 @@ def _init_keycloak(app: Flask) -> None:
 
     @app.route("/login")
     def kc_login():
-        redirect_uri = url_for("kc_callback", _external=True)
+        redirect_uri = _oauth_redirect_url("kc_callback")
         return _oauth.keycloak.authorize_redirect(redirect_uri)
 
     @app.route("/callback")
@@ -168,7 +192,7 @@ def _init_keycloak(app: Flask) -> None:
         session.clear()
         end_session_url = (
             f"{_realm_url(external=True)}/protocol/openid-connect/logout"
-            f"?post_logout_redirect_uri={url_for('kc_login', _external=True)}"
+            f"?post_logout_redirect_uri={_oauth_redirect_url('kc_login')}"
         )
         if id_token:
             end_session_url += f"&id_token_hint={id_token}"

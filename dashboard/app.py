@@ -11,6 +11,7 @@ import json
 import logging
 from datetime import datetime
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ── Auth module (shared across services) ─────────────────────────────────────
 # Add parent dir to path so `auth` package is importable
@@ -23,6 +24,19 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(32).hex())
+
+# Behind TLS-terminating reverse proxies, trust X-Forwarded-Proto / Host so
+# OAuth redirect_uri values use https:// when the browser uses HTTPS.
+app.wsgi_app = ProxyFix(
+    app.wsgi_app,
+    x_for=1,
+    x_proto=1,
+    x_host=1,
+    x_port=1,
+    x_prefix=1,
+)
+app.config["PREFERRED_URL_SCHEME"] = os.environ.get("PREFERRED_URL_SCHEME", "http")
+
 CORS(app)
 
 # Initialise auth (registers /login, /logout, /callback routes)

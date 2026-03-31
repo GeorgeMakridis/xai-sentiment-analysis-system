@@ -75,6 +75,8 @@ services:
       - KC_REALM=${KC_REALM:-xai-platform}
       - KC_CLIENT_ID=${KC_CLIENT_ID:-xai-dashboard}
       - KC_CLIENT_SECRET=${KC_CLIENT_SECRET:-}
+      - PREFERRED_URL_SCHEME=${PREFERRED_URL_SCHEME:-http}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - LEGACY_ADMIN_PW=${LEGACY_ADMIN_PW:-changeme}
       - LEGACY_ANALYST_PW=${LEGACY_ANALYST_PW:-changeme}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
