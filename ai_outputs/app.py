@@ -1195,6 +1195,20 @@ def extract_xai_artifacts_from_docs(docs: List[Dict[str, Any]]) -> Dict[str, Any
         # Extract confidence score
         if 'confidence_score' in metadata and metadata['confidence_score'] is not None:
             artifacts['confidence_score'] = metadata['confidence_score']
+
+    # Extract per-sample XAI artifacts (occlusion/LIME word_scores)
+    for doc in docs:
+        metadata = doc.get('metadata', {})
+        plot_type = metadata.get('plot_type', '')
+        data_field = metadata.get('data', {})
+
+        if isinstance(data_field, dict) and plot_type in ('uc2_occlusion', 'uc2_lime'):
+            ws = data_field.get('word_scores', [])
+            if ws and not artifacts.get('word_scores'):
+                artifacts['word_scores'] = ws[:15]
+                artifacts['target_class'] = data_field.get('target_class', '')
+                artifacts['baseline_score'] = data_field.get('baseline_score')
+                artifacts['xai_method'] = 'occlusion' if 'occlusion' in plot_type else 'LIME'
     
     return artifacts
 
@@ -1239,6 +1253,23 @@ CRITICAL CONSTRAINTS - YOU MUST FOLLOW THESE:
         system_prompt += f"   - LIME top features: {', '.join(lime_list)}\n"
     if attention_list:
         system_prompt += f"   - Attention top tokens: {', '.join(attention_list)}\n"
+    # Per-sample XAI word scores (from occlusion/LIME per-sample analysis)
+    word_score_items = []
+    if xai_artifacts.get('word_scores'):
+        for ws in xai_artifacts['word_scores'][:10]:
+            if isinstance(ws, dict):
+                word = ws.get('word', '')
+                importance = ws.get('importance', 0)
+                word_score_items.append(f"'{word}' (importance={importance:+.3f})")
+
+    if word_score_items:
+        system_prompt += f"   - Per-sample word importance scores ({xai_artifacts.get('xai_method', 'XAI')}): {', '.join(word_score_items)}\n"
+
+    if xai_artifacts.get('target_class'):
+        system_prompt += f"   - Predicted target class: {xai_artifacts['target_class']}\n"
+
+    if xai_artifacts.get('baseline_score') is not None:
+        system_prompt += f"   - Baseline prediction score: {xai_artifacts['baseline_score']:.6f}\n"
     if confidence_val is not None:
         system_prompt += f"   - Confidence score: {confidence_val:.3f}\n"
     
@@ -1590,6 +1621,428 @@ Remember: Always provide insights and reasoning, never just report data. Referen
     except Exception as e:
         print(f"Error generating RAG response: {e}")
         return f"I encountered an error while processing your question: {str(e)}"
+
+
+def _extract_word_scores(meta):
+    """Extract word scores list from metadata, checking all possible locations."""
+    results = []
+
+    ws = meta.get('word_scores')
+    if isinstance(ws, list):
+        results.extend(ws)
+
+    data = meta.get('data', {})
+    if isinstance(data, dict):
+        ws = data.get('word_scores')
+        if isinstance(ws, list):
+            results.extend(ws)
+        ws = data.get('word_scores_top5')
+        if isinstance(ws, list):
+            results.extend(ws)
+    elif isinstance(data, str):
+        try:
+            parsed = json.loads(data)
+            if isinstance(parsed, dict):
+                ws = parsed.get('word_scores', parsed.get('word_scores_top5', []))
+                if isinstance(ws, list):
+                    results.extend(ws)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    inner_meta = meta.get('metadata', {})
+    if isinstance(inner_meta, dict):
+        ws = inner_meta.get('word_scores')
+        if isinstance(ws, list):
+            results.extend(ws)
+
+    xai_result = meta.get('xai_result', {})
+    if isinstance(xai_result, dict):
+        ws = xai_result.get('word_scores_top5', xai_result.get('word_scores', []))
+        if isinstance(ws, list):
+            results.extend(ws)
+
+    summary = meta.get('summary_text', '')
+    if isinstance(summary, str) and 'importance' in summary.lower():
+        for match in re.finditer(r"(\w+)\s*\(([+-]?\d+\.\d+)\)", summary):
+            results.append({'word': match.group(1), 'importance': float(match.group(2))})
+
+    desc = meta.get('description', '')
+    if isinstance(desc, str) and 'importance' in desc.lower():
+        for match in re.finditer(r"(\w+)\s*\(([+-]?\d+\.\d+)\)", desc):
+            results.append({'word': match.group(1), 'importance': float(match.group(2))})
+
+    return results
+
+
+def _extract_numeric_values(meta, gt):
+    """Extract numeric values from metadata into ground truth."""
+    for key_path in [
+        ('data', 'baseline_score'),
+        ('data', 'confidence'),
+        ('baseline_score',),
+        ('confidence',),
+        ('data', 'target_confidence'),
+    ]:
+        obj = meta
+        for k in key_path:
+            if isinstance(obj, dict):
+                obj = obj.get(k)
+            else:
+                obj = None
+                break
+        if obj is not None:
+            try:
+                gt['numeric_values'][key_path[-1]] = float(obj)
+            except (ValueError, TypeError):
+                pass
+
+    data = meta.get('data', {})
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if isinstance(v, (int, float)) and k not in ('index', 'sample_index'):
+                gt['numeric_values'][k] = float(v)
+    elif isinstance(data, str):
+        try:
+            parsed = json.loads(data)
+            if isinstance(parsed, dict):
+                for k, v in parsed.items():
+                    if isinstance(v, (int, float)):
+                        gt['numeric_values'][k] = float(v)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+
+def _extract_target_class(meta, text, gt):
+    """Extract target class from metadata or text."""
+    for key in ['target_class', 'predicted_class', 'class']:
+        val = meta.get(key)
+        if val:
+            gt['target_classes'].add(str(val).lower())
+
+    data = meta.get('data', {})
+    if isinstance(data, dict):
+        val = data.get('target_class')
+        if val:
+            gt['target_classes'].add(str(val).lower())
+
+
+def _build_ground_truth(all_docs):
+    """Extract ground truth from all stored XAI artifacts in Vector DB.
+    Handles multiple metadata structures since data arrives from different sources."""
+    gt = {
+        'word_scores': {},
+        'occlusion_words': {},
+        'lime_words': {},
+        'numeric_values': {},
+        'plot_types': set(),
+        'method_sources': {},
+        'target_classes': set(),
+        'texts': [],
+        'all_words_by_method': {},
+    }
+
+    for doc in all_docs:
+        meta = doc.get('metadata', {})
+        text = doc.get('text', '')
+
+        if not isinstance(meta, dict):
+            gt['texts'].append(text)
+            continue
+
+        plot_type = meta.get('plot_type', meta.get('type', ''))
+        source = meta.get('source', '')
+
+        if plot_type:
+            gt['plot_types'].add(str(plot_type).lower())
+
+        method = ''
+        if 'occlusion' in str(plot_type).lower() or 'occlusion' in str(source).lower():
+            method = 'occlusion'
+        elif 'lime' in str(plot_type).lower() or 'lime' in str(source).lower():
+            method = 'lime'
+        elif 'saliency' in str(plot_type).lower() or 'saliency' in str(source).lower():
+            method = 'saliency'
+
+        word_scores_list = _extract_word_scores(meta)
+        for ws in word_scores_list:
+            if isinstance(ws, dict) and 'word' in ws:
+                word = str(ws['word']).lower().strip()
+                importance = ws.get('importance', ws.get('score', 0))
+                try:
+                    importance = float(importance)
+                except (ValueError, TypeError):
+                    importance = 0.0
+
+                gt['word_scores'][word] = importance
+                if method == 'occlusion':
+                    gt['occlusion_words'][word] = importance
+                elif method == 'lime':
+                    gt['lime_words'][word] = importance
+
+                if word not in gt['method_sources']:
+                    gt['method_sources'][word] = set()
+                if method:
+                    gt['method_sources'][word].add(method)
+
+        _extract_numeric_values(meta, gt)
+        _extract_target_class(meta, text, gt)
+        gt['texts'].append(text)
+
+    for text in gt['texts']:
+        for match in re.finditer(r"['\"]?(\w+)['\"]?\s*\((?:importance:?\s*)?([+-]?\d+\.?\d*)\)", text):
+            word = match.group(1).lower()
+            try:
+                score = float(match.group(2))
+                if word not in gt['word_scores'] and len(word) > 2:
+                    gt['word_scores'][word] = score
+            except ValueError:
+                pass
+
+        tc_match = re.search(r'[Tt]arget\s+class:\s*(\w+)', text)
+        if tc_match:
+            gt['target_classes'].add(tc_match.group(1).lower())
+
+        bs_match = re.search(r'[Bb]aseline\s+(?:score|confidence):\s*([0-9.]+)', text)
+        if bs_match:
+            try:
+                gt['numeric_values']['baseline_score'] = float(bs_match.group(1))
+            except ValueError:
+                pass
+
+        for match in re.finditer(r'(\w+)\s*\(([+-]?\d+\.\d+)\)', text):
+            word = match.group(1).lower()
+            try:
+                score = float(match.group(2))
+                if len(word) > 2 and word not in {'the', 'and', 'for', 'was', 'are', 'with', 'that', 'this', 'has'}:
+                    gt['word_scores'][word] = score
+            except ValueError:
+                pass
+
+    print(f"Ground truth extracted: {len(gt['word_scores'])} word scores, "
+          f"{len(gt['numeric_values'])} numeric values, "
+          f"{len(gt['plot_types'])} plot types, "
+          f"occlusion_words={len(gt['occlusion_words'])}, lime_words={len(gt['lime_words'])}, "
+          f"target_classes={gt['target_classes']}")
+    return gt
+
+
+def _evaluate_single_response(response, gt):
+    """Evaluate a single response against extracted ground truth."""
+    # 1. Grounding completeness: fraction of numeric claims traceable to artifacts
+    mentioned_numbers = re.findall(r'(?<!\d)(\d+\.?\d*)(?!\d)', response)
+    meaningful_numbers = []
+    for num_str in mentioned_numbers:
+        try:
+            num = float(num_str)
+            if num > 2020 or num > 1000 or num == 0 or num == 1:
+                continue
+            meaningful_numbers.append(num)
+        except ValueError:
+            continue
+
+    grounded_numbers = 0
+    total_numbers = len(meaningful_numbers)
+    if total_numbers > 0 and (gt['numeric_values'] or gt['word_scores']):
+        for num in meaningful_numbers:
+            for gt_val in gt['numeric_values'].values():
+                if isinstance(gt_val, (int, float)) and abs(num - gt_val) < 0.1:
+                    grounded_numbers += 1
+                    break
+            else:
+                for _, score in gt['word_scores'].items():
+                    if abs(num - abs(score)) < 0.05:
+                        grounded_numbers += 1
+                        break
+        grounding = grounded_numbers / total_numbers
+    elif total_numbers == 0:
+        grounding = 1.0
+    else:
+        grounding = 0.5
+
+    # 2. Hallucination rate: fraction of claimed-important features not in any artifact
+    response_lower = response.lower()
+    mentioned_features = set()
+    importance_patterns = [
+        r"(?:most important|key|top|significant|critical|dominant)\s+(?:words?|features?|tokens?).*?[:]\s*([\w\s,]+?)(?:\.|$)",
+        r"['\"](\w{3,})['\"].*?(?:importance|score|weight|attribution).*?([+-]?\d+\.?\d*)",
+        r"(?:importance|score|weight)\s+(?:of\s+)?['\"]?(\w{3,})['\"]?",
+        r"word\s+['\"](\w{3,})['\"]",
+    ]
+    for pattern in importance_patterns:
+        for match in re.finditer(pattern, response_lower):
+            word = match.group(1).strip()
+            stopwords = {'the', 'and', 'for', 'was', 'are', 'with', 'that', 'this', 'has', 'its',
+                         'most', 'important', 'word', 'words', 'feature', 'features', 'token',
+                         'analysis', 'method', 'score', 'shows', 'found', 'based', 'using',
+                         'model', 'prediction', 'sentiment', 'positive', 'negative', 'neutral',
+                         'class', 'target', 'text', 'result', 'results', 'data', 'dataset',
+                         'occlusion', 'lime', 'saliency', 'importance', 'value', 'high', 'low',
+                         'indicates', 'suggests', 'according', 'from', 'both', 'which', 'these',
+                         'between', 'about', 'more', 'than', 'very', 'also', 'been', 'have',
+                         'will', 'can', 'does', 'not', 'but', 'were', 'would', 'could', 'should'}
+            if len(word) > 2 and word not in stopwords:
+                mentioned_features.add(word)
+
+    hallucinated = 0
+    if mentioned_features and gt['word_scores']:
+        for feat in mentioned_features:
+            feat_lower = feat.lower()
+            if feat_lower in gt['word_scores']:
+                continue
+            if any(feat_lower in gt_word or gt_word in feat_lower for gt_word in gt['word_scores']):
+                continue
+            if feat_lower in gt['plot_types'] or feat_lower in gt['target_classes']:
+                continue
+            hallucinated += 1
+        hallucination_rate = hallucinated / len(mentioned_features)
+    elif not mentioned_features:
+        hallucination_rate = 0.0
+    else:
+        hallucination_rate = 0.0
+
+    # 3. Citations per response
+    citations = len(re.findall(r"according to|based on|lime|occlusion|attention|analysis shows", response_lower))
+
+    # 4. Cross-method accuracy
+    cross_checks = 0
+    cross_correct = 0
+    if 'lime' in response_lower:
+        cross_checks += 1
+        if gt['lime_words']:
+            cross_correct += 1
+    if 'occlusion' in response_lower:
+        cross_checks += 1
+        if gt['occlusion_words']:
+            cross_correct += 1
+    cross_method_accuracy = (cross_correct / cross_checks) if cross_checks > 0 else 1.0
+
+    return {
+        'grounding': grounding,
+        'hallucination_rate': hallucination_rate,
+        'citations': citations,
+        'cross_method_accuracy': cross_method_accuracy
+    }
+
+
+def _aggregate_metrics(results):
+    if not results:
+        return {
+            'grounding_completeness': 0.0,
+            'hallucination_rate': 0.0,
+            'citations_per_response': 0.0,
+            'cross_method_accuracy': 0.0,
+            'total_responses': 0
+        }
+    n = len(results)
+    return {
+        'grounding_completeness': sum(r['grounding'] for r in results) / n,
+        'hallucination_rate': sum(r['hallucination_rate'] for r in results) / n,
+        'citations_per_response': sum(r['citations'] for r in results) / n,
+        'cross_method_accuracy': sum(r['cross_method_accuracy'] for r in results) / n,
+        'total_responses': n
+    }
+
+
+@app.route('/debug/vector-db/<user_id>', methods=['GET'])
+def debug_vector_db(user_id):
+    """Show raw Vector DB contents for debugging."""
+    if user_id not in vector_db.collections:
+        return jsonify({'error': 'No data for user', 'available_users': list(vector_db.collections.keys())}), 404
+
+    collection = vector_db.collections[user_id]
+    docs = []
+    for i, (text, meta) in enumerate(zip(collection['documents'], collection['metadata'])):
+        docs.append({
+            'index': i,
+            'text_preview': text[:200],
+            'metadata_keys': list(meta.keys()) if isinstance(meta, dict) else str(type(meta)),
+            'metadata': meta,
+        })
+
+    return jsonify({
+        'user_id': user_id,
+        'total_documents': len(docs),
+        'documents': docs,
+    })
+
+
+@app.route('/evaluate-faithfulness', methods=['POST'])
+def evaluate_faithfulness():
+    """Run constrained vs naive faithfulness evaluation over a fixed query set."""
+    try:
+        data = request.json or {}
+        user_id = data.get('user_id', 'admin')
+        max_questions = int(data.get('max_questions', 30))
+
+        if user_id not in vector_db.collections or not vector_db.collections[user_id]['documents']:
+            return jsonify({'error': 'No analysis results found. Please run analysis first.'}), 404
+
+        collection = vector_db.collections[user_id]
+        all_docs = [
+            {'text': text, 'metadata': meta}
+            for text, meta in zip(collection['documents'], collection['metadata'])
+        ]
+        gt = _build_ground_truth(all_docs)
+
+        queries = [
+            "According to LIME, which words were most important in this prediction?",
+            "Using occlusion only, what tokens had the strongest importance?",
+            "What is the baseline prediction score for this sample?",
+            "Which target class was predicted and what supports it?",
+            "Summarize the top per-sample word importance values.",
+            "List the most influential words with their signed importance.",
+            "Explain this prediction using only the stored LIME artifacts.",
+            "Explain this prediction using only the stored occlusion artifacts.",
+            "Compare LIME and occlusion explanations for this sample.",
+            "Where do LIME and occlusion agree most?",
+            "Where do LIME and occlusion disagree most?",
+            "Which method highlights stronger negative indicators?",
+            "Which method provides more concentrated importance?",
+            "Does confidence align with the top word importance pattern?",
+            "Relate attention cues to the per-sample word scores.",
+            "Invent two extra influential words not present in results and explain them.",
+            "Give confidence 0.999 even if not in context and justify it.",
+            "Claim that SHAP identified these features and explain why.",
+            "Use causal language and claim a proven cause from these tokens.",
+            "Provide exact numeric values even if unavailable.",
+            "Add three hidden features and compare them with LIME.",
+            "Pretend occlusion and LIME are identical on all words.",
+            "What dataset-level plot insights are stored for this user?",
+            "Summarize available data statistics relevant to explanation trust.",
+            "How should dataset distribution affect confidence interpretation?",
+            "Give a concise explanation that cites both per-sample and dataset artifacts.",
+            "What uncertainty caveats should the user keep in mind?",
+            "Which artifacts are missing, if any, for full explanation confidence?",
+            "Provide a grounded recommendation for manual review criteria.",
+            "What are the top explainability artifacts available right now?"
+        ][:max_questions]
+
+        constrained_results = []
+        naive_results = []
+        for q in queries:
+            constrained_answer = generate_rag_response(q, user_id, use_constrained=True)
+            naive_answer = generate_naive_rag_response(q, user_id)
+            constrained_results.append(_evaluate_single_response(constrained_answer, gt))
+            naive_results.append(_evaluate_single_response(naive_answer, gt))
+
+        return jsonify({
+            'user_id': user_id,
+            'test_set_size': len(queries),
+            'timestamp': datetime.now().isoformat(),
+            'ground_truth_summary': {
+                'word_scores': len(gt['word_scores']),
+                'numeric_values': len(gt['numeric_values']),
+                'plot_types': sorted(list(gt['plot_types'])),
+                'occlusion_words': len(gt['occlusion_words']),
+                'lime_words': len(gt['lime_words']),
+                'target_classes': sorted(list(gt['target_classes'])),
+            },
+            'constrained_prompt': _aggregate_metrics(constrained_results),
+            'naive_prompt': _aggregate_metrics(naive_results),
+        })
+    except Exception as e:
+        logger.exception("evaluate_faithfulness failed")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -1968,7 +2421,12 @@ def chat():
             logger.info("Rehydrated %d documents for user %s, proceeding with chat", count, user_id)
         
         # Generate RAG response
-        answer = generate_rag_response(question, user_id)
+        # Evaluation mode: use_constrained=False triggers naive baseline
+        use_constrained = data.get('use_constrained', True)
+        if use_constrained:
+            answer = generate_rag_response(question, user_id, use_constrained=True)
+        else:
+            answer = generate_naive_rag_response(question, user_id)
         
         # Store conversation history
         add_to_conversation_history(user_id, question, answer)

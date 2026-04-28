@@ -445,6 +445,72 @@ def ingest_data():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/samples/<user_id>', methods=['GET'])
+def get_samples(user_id):
+    """Return N rows from the user's ingested dataset for per-sample XAI display."""
+    try:
+        n = min(int(request.args.get('n', 50)), 500)
+
+        with _data_store_lock:
+            if user_id not in data_store:
+                return jsonify({'error': 'No data found. Please upload/select a dataset first.'}), 404
+            user_data = data_store[user_id]
+
+        df = user_data['data']
+        data_type = user_data.get('data_type', 'tabular')
+
+        # Auto-detect text and sentiment columns
+        text_col = None
+        sent_col = None
+        for col in df.columns:
+            cl = col.lower()
+            if text_col is None and any(t in cl for t in ['text', 'title', 'content', 'sentence', 'review', 'headline']):
+                text_col = col
+            if sent_col is None and any(t in cl for t in ['sentiment', 'finbert_sentiment', 'label', 'target', 'class']):
+                sent_col = col
+
+        # For image data, detect image/path columns
+        image_col = None
+        for col in df.columns:
+            cl = col.lower()
+            if any(t in cl for t in ['image', 'img', 'file_path', 'path', 'photo', 'filename']):
+                image_col = col
+                break
+
+        # Build samples list
+        samples = []
+        for i, (_, row) in enumerate(df.head(n).iterrows()):
+            sample = {'index': i}
+            if text_col:
+                sample['text'] = str(row[text_col])
+            if sent_col:
+                sample['sentiment'] = str(row[sent_col])
+            if image_col:
+                sample['image_path'] = str(row[image_col])
+            # Include asset if present
+            if 'asset' in df.columns:
+                sample['asset'] = str(row['asset'])
+            samples.append(sample)
+
+        return jsonify({
+            'samples': samples,
+            'total': len(df),
+            'returned': len(samples),
+            'data_type': data_type,
+            'columns': {
+                'text': text_col,
+                'sentiment': sent_col,
+                'image': image_col,
+                'all': df.columns.tolist(),
+            }
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/data-statistics', methods=['POST'])
 def data_statistics():
     """Generate and return basic overview plot automatically. Additional plots can be requested via plot selection."""

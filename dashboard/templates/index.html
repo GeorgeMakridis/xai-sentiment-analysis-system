@@ -1245,7 +1245,13 @@
                     <div id="dataTypeIndicator" style="display: none; padding: 12px 20px; border-radius: 8px; font-weight: 600; font-size: 0.9rem;"></div>
                 </div>
             </div>
-            
+
+            <div style="display:flex; gap:0; border-bottom:2px solid #e0e0e0; margin-bottom:16px;">
+                <button type="button" id="mainTabBulk" onclick="switchMainTab('bulk')" style="padding:10px 24px; border:none; cursor:pointer; font-size:0.9rem; font-weight:600; background:transparent; border-bottom:3px solid #2E75B6; color:#2E75B6;">📊 Dataset Analysis</button>
+                <button type="button" id="mainTabPerSample" onclick="switchMainTab('persample')" style="padding:10px 24px; border:none; cursor:pointer; font-size:0.9rem; font-weight:600; background:transparent; border-bottom:3px solid transparent; color:#666;">🔬 Per-Sample XAI</button>
+            </div>
+
+            <div id="panelBulk">
             <div class="summary-stats" id="summaryStats" style="display: none;">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
                     <h3 style="margin: 0;"><span style="font-size: 1.5rem;">📊</span> Data Summary & Analysis Overview</h3>
@@ -1271,7 +1277,508 @@
                     <p>Upload your sentiment data to get started with explainable AI analysis using FinBERT.</p>
                 </div>
             </div>
+            </div>
+
+            <div id="panelPerSample" style="display:none; padding-top:8px;">
+                <div style="display:flex; justify-content:flex-end; align-items:center; margin-bottom:16px; border-bottom:2px solid #2E75B6; padding-bottom:12px;">
+                    <select id="xaiModelSelect" style="padding:6px 12px; border-radius:6px; border:1px solid #ccc; font-size:0.85rem;">
+                        <option value="">Loading models...</option>
+                    </select>
+                </div>
+
+                <!-- UC tabs (hidden when data type is clearly text vs image) -->
+                <div id="xaiSubTabRow" style="display:flex; gap:8px; margin-bottom:16px;">
+                    <button id="tabUC1" onclick="switchXAITab('uc1')" class="action-btn" style="padding:8px 20px; font-size:0.85rem;">🖼️ UC1 — Vision</button>
+                    <button id="tabUC2" onclick="switchXAITab('uc2')" class="action-btn" style="padding:8px 20px; font-size:0.85rem;">📝 UC2 — NLP</button>
+                </div>
+
+                <!-- ── UC1 Panel ── -->
+                <div id="panelUC1" style="display:none;">
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px;">
+                        <div>
+                            <label style="font-weight:600; font-size:0.85rem;">Select Image</label>
+                            <select id="uc1ImageSelect" onchange="loadUC1Image()" style="width:100%; padding:8px; border-radius:6px; border:1px solid #ccc; margin-top:4px;">
+                                <option value="">-- load images --</option>
+                            </select>
+                        </div>
+                        <div style="display:flex; gap:8px; align-items:end;">
+                            <button onclick="runUC1Predict()" class="action-btn" style="padding:8px 16px; font-size:0.85rem;">🤖 Detect Objects</button>
+                            <button onclick="runUC1Saliency()" class="action-btn" style="padding:8px 16px; font-size:0.85rem; background:#2E75B6; color:#fff;">🔥 Run Saliency</button>
+                        </div>
+                    </div>
+                    <!-- Saliency params -->
+                    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin-bottom:16px; padding:12px; background:#f8f9fa; border-radius:8px;">
+                        <div>
+                            <label style="font-size:0.8rem; font-weight:600;">Detection Index</label>
+                            <input type="number" id="uc1DetIdx" value="0" min="0" style="width:100%; padding:6px; border-radius:4px; border:1px solid #ccc;">
+                        </div>
+                        <div>
+                            <label style="font-size:0.8rem; font-weight:600;">Patch×Stride</label>
+                            <select id="uc1PatchStride" style="width:100%; padding:6px; border-radius:4px; border:1px solid #ccc;">
+                                <option value="16,8">16 × 8</option>
+                                <option value="32,16">32 × 16</option>
+                                <option value="48,24">48 × 24</option>
+                                <option value="64,32" selected>64 × 32</option>
+                                <option value="80,40">80 × 40</option>
+                                <option value="96,48">96 × 48</option>
+                                <option value="128,64">128 × 64</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:0.8rem; font-weight:600;">IoU Threshold</label>
+                            <input type="range" id="uc1IoU" min="0.1" max="0.9" step="0.05" value="0.4" oninput="document.getElementById('uc1IoUVal').textContent=this.value" style="width:100%;">
+                            <span id="uc1IoUVal" style="font-size:0.8rem;">0.4</span>
+                        </div>
+                    </div>
+                    <!-- UC1 results -->
+                    <div id="uc1Results" style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+                        <div>
+                            <h4 style="margin:0 0 8px 0;">Image / Detections</h4>
+                            <div id="uc1ImageBox" style="min-height:200px; border:1px solid #eee; border-radius:8px; display:flex; align-items:center; justify-content:center; overflow:hidden; background:#fafafa;">
+                                <span style="color:#aaa;">Select an image</span>
+                            </div>
+                            <div id="uc1DetTable" style="margin-top:8px; font-size:0.8rem;"></div>
+                        </div>
+                        <div>
+                            <h4 style="margin:0 0 8px 0;">Saliency Heatmap</h4>
+                            <div id="uc1SaliencyBox" style="min-height:200px; border:1px solid #eee; border-radius:8px; display:flex; align-items:center; justify-content:center; overflow:hidden; background:#fafafa;">
+                                <span style="color:#aaa;">Run saliency to see heatmap</span>
+                            </div>
+                            <div id="uc1StorageRef" style="margin-top:4px; font-size:0.75rem; color:#888;"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ── UC2 Panel ── -->
+                <div id="panelUC2" style="display:none;">
+                    <div style="display:grid; grid-template-columns:2fr 1fr; gap:16px; margin-bottom:16px;">
+                        <div>
+                            <label style="font-weight:600; font-size:0.85rem;">Sample Index</label>
+                            <input type="range" id="uc2SampleIdx" min="0" max="19" value="0" oninput="loadUC2Sample(this.value)" style="width:100%;">
+                            <div style="display:flex; justify-content:space-between; font-size:0.75rem; color:#888;"><span>0</span><span id="uc2IdxLabel">0</span><span id="uc2MaxLabel">19</span></div>
+                        </div>
+                        <div style="display:flex; gap:8px; align-items:end;">
+                            <button onclick="runUC2Predict()" class="action-btn" style="padding:8px 12px; font-size:0.85rem;">🤖 Predict</button>
+                        </div>
+                    </div>
+                    <div id="uc2TextBox" style="padding:12px; background:#f8f9fa; border-radius:8px; margin-bottom:12px; font-size:0.9rem; min-height:60px; white-space:pre-wrap;"></div>
+                    <div id="uc2TrueLabel" style="font-size:0.8rem; margin-bottom:12px; color:#555;"></div>
+                    <!-- Model prediction -->
+                    <div id="uc2PredBar" style="display:none; margin-bottom:16px;">
+                        <h4 style="margin:0 0 8px 0;">Model Prediction</h4>
+                        <div style="display:flex; gap:16px;">
+                            <div style="flex:1; text-align:center;"><div style="font-size:0.75rem; color:#888;">Positive</div><div id="uc2PosScore" style="font-size:1.2rem; font-weight:700; color:#27ae60;">-</div></div>
+                            <div style="flex:1; text-align:center;"><div style="font-size:0.75rem; color:#888;">Negative</div><div id="uc2NegScore" style="font-size:1.2rem; font-weight:700; color:#e74c3c;">-</div></div>
+                            <div style="flex:1; text-align:center;"><div style="font-size:0.75rem; color:#888;">Neutral</div><div id="uc2NeuScore" style="font-size:1.2rem; font-weight:700; color:#3498db;">-</div></div>
+                        </div>
+                    </div>
+                    <!-- XAI controls -->
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px;">
+                        <div>
+                            <button onclick="runUC2Occlusion()" class="action-btn" style="width:100%; padding:10px; font-size:0.85rem; background:#e74c3c; color:#fff;">🔍 Run Occlusion</button>
+                        </div>
+                        <div>
+                            <div style="display:flex; gap:8px; margin-bottom:6px;">
+                                <div style="flex:1;"><label style="font-size:0.75rem;">Features</label><input type="number" id="uc2LimeFeatures" value="10" min="3" max="20" style="width:100%; padding:4px; border:1px solid #ccc; border-radius:4px;"></div>
+                                <div style="flex:1;"><label style="font-size:0.75rem;">Samples</label><input type="number" id="uc2LimeSamples" value="100" min="50" max="500" step="50" style="width:100%; padding:4px; border:1px solid #ccc; border-radius:4px;"></div>
+                            </div>
+                            <button onclick="runUC2Lime()" class="action-btn" style="width:100%; padding:10px; font-size:0.85rem; background:#2E75B6; color:#fff;">🧪 Run LIME</button>
+                        </div>
+                    </div>
+                    <!-- XAI results side by side -->
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+                        <div id="uc2OcclusionResult"></div>
+                        <div id="uc2LimeResult"></div>
+                    </div>
+                </div>
+
+                <div id="xaiSpinner" style="display:none; text-align:center; padding:20px;">
+                    <div style="display:inline-block; width:24px; height:24px; border:3px solid #2E75B6; border-top-color:transparent; border-radius:50%; animation:spin 0.8s linear infinite;"></div>
+                    <span style="margin-left:8px; color:#555;" id="xaiSpinnerText">Processing...</span>
+                </div>
+            </div>
         </div>
+
+        <style>
+            @keyframes spin { to { transform: rotate(360deg); } }
+            .xai-word { display:inline-block; padding:2px 3px; margin:1px; border-radius:3px; line-height:2.2; }
+        </style>
+
+        <script>
+        // ═══════════════════════════════════════════════════════════════
+        // Per-Sample XAI JavaScript (uses uploadedData from main dashboard script below)
+        // ═══════════════════════════════════════════════════════════════
+
+        let xaiSamples = [];
+        var xaiTextRef = '';
+        const PSX_DATASETS_BUCKET = '{{ restfs_bucket_datasets|default("xai-datasets") }}';
+        const PSX_USER_ID = '{{ username|default("admin") }}';
+
+        function getCurrentDatasetFilename() {
+            if (typeof uploadedData === 'undefined' || !uploadedData || !uploadedData.file_path) return '';
+            const fp = uploadedData.file_path;
+            return fp.split(/[/\\\\]/).pop() || '';
+        }
+
+        function getUC2TextRef() {
+            const fn = getCurrentDatasetFilename();
+            if (!fn) return '';
+            return 'minio://' + PSX_DATASETS_BUCKET + '/' + PSX_USER_ID + '/' + fn;
+        }
+
+        function hideXAISubTabs() {
+            const tabRow = document.getElementById('xaiSubTabRow');
+            if (tabRow) tabRow.style.display = 'none';
+        }
+
+        function showXAISubTabs() {
+            const tabRow = document.getElementById('xaiSubTabRow');
+            if (tabRow) tabRow.style.display = 'flex';
+        }
+
+        function showPerSampleMessage(msg) {
+            hideXAISubTabs();
+            const p1 = document.getElementById('panelUC1');
+            const p2 = document.getElementById('panelUC2');
+            if (p1) p1.style.display = 'none';
+            if (p2) p2.style.display = 'none';
+            let msgDiv = document.getElementById('xaiNoDataMsg');
+            if (!msgDiv) {
+                msgDiv = document.createElement('div');
+                msgDiv.id = 'xaiNoDataMsg';
+                msgDiv.style.cssText = 'text-align:center; padding:60px 20px; color:#666; font-size:1rem;';
+                const panel = document.getElementById('panelPerSample');
+                if (panel) panel.prepend(msgDiv);
+            }
+            msgDiv.innerHTML = '<h3 style="color:#44546A;">🔬 Per-Sample Explainability</h3><p>' + msg + '</p>';
+            msgDiv.style.display = 'block';
+        }
+
+        function switchMainTab(tab) {
+            const bulk = document.getElementById('panelBulk');
+            const ps = document.getElementById('panelPerSample');
+            if (bulk) bulk.style.display = tab === 'bulk' ? 'block' : 'none';
+            if (ps) ps.style.display = tab === 'persample' ? 'block' : 'none';
+            const tb = document.getElementById('mainTabBulk');
+            const tp = document.getElementById('mainTabPerSample');
+            if (tb) {
+                tb.style.borderBottomColor = tab === 'bulk' ? '#2E75B6' : 'transparent';
+                tb.style.color = tab === 'bulk' ? '#2E75B6' : '#666';
+            }
+            if (tp) {
+                tp.style.borderBottomColor = tab === 'persample' ? '#2E75B6' : 'transparent';
+                tp.style.color = tab === 'persample' ? '#2E75B6' : '#666';
+            }
+            if (tab === 'persample') {
+                loadXAIModels();
+                if (typeof uploadedData === 'undefined' || !uploadedData) {
+                    showPerSampleMessage('Please upload or select a dataset first using the sidebar.');
+                    return;
+                }
+                const msgDiv = document.getElementById('xaiNoDataMsg');
+                if (msgDiv) msgDiv.style.display = 'none';
+                let dataType = (uploadedData.data_summary && uploadedData.data_summary.data_type) || uploadedData.data_type;
+                if (!dataType && typeof getSelectedDataType === 'function') {
+                    try { dataType = getSelectedDataType(); } catch (e) {}
+                }
+                if (dataType === 'image') {
+                    hideXAISubTabs();
+                    switchXAITab('uc1');
+                } else if (dataType === 'text' || dataType === 'sentiment') {
+                    hideXAISubTabs();
+                    switchXAITab('uc2');
+                } else {
+                    showXAISubTabs();
+                    switchXAITab('uc2');
+                }
+            }
+        }
+
+        function switchXAITab(tab) {
+            const msgDiv = document.getElementById('xaiNoDataMsg');
+            if (msgDiv) msgDiv.style.display = 'none';
+            document.getElementById('panelUC1').style.display = tab === 'uc1' ? 'block' : 'none';
+            document.getElementById('panelUC2').style.display = tab === 'uc2' ? 'block' : 'none';
+            document.getElementById('tabUC1').style.background = tab === 'uc1' ? '#2E75B6' : '';
+            document.getElementById('tabUC1').style.color = tab === 'uc1' ? '#fff' : '';
+            document.getElementById('tabUC2').style.background = tab === 'uc2' ? '#2E75B6' : '';
+            document.getElementById('tabUC2').style.color = tab === 'uc2' ? '#fff' : '';
+            if (tab === 'uc1') loadUC1Images();
+            if (tab === 'uc2') loadUC2Samples();
+        }
+
+        function loadXAIModels() {
+            fetch('/api/xai/models').then(r => r.json()).then(data => {
+                const sel = document.getElementById('xaiModelSelect');
+                sel.innerHTML = '';
+                (data.models || []).forEach(m => {
+                    const opt = document.createElement('option');
+                    opt.value = m.id;
+                    opt.textContent = m.name + ' (' + m.use_case.toUpperCase() + ')';
+                    sel.appendChild(opt);
+                });
+                if (!data.models || data.models.length === 0) sel.innerHTML = '<option>No models available</option>';
+            }).catch(() => {
+                document.getElementById('xaiModelSelect').innerHTML = '<option>Model service unavailable</option>';
+            });
+        }
+
+        function showXAISpinner(msg) {
+            document.getElementById('xaiSpinnerText').textContent = msg || 'Processing...';
+            document.getElementById('xaiSpinner').style.display = 'block';
+        }
+        function hideXAISpinner() { document.getElementById('xaiSpinner').style.display = 'none'; }
+
+        // ── UC1 ──
+        function loadUC1Images() {
+            const currentFile = getCurrentDatasetFilename();
+            if (!currentFile) {
+                const sel = document.getElementById('uc1ImageSelect');
+                sel.innerHTML = '<option value="">No dataset filename — select a dataset first</option>';
+                return;
+            }
+            const url = '/api/xai/uc1/images-from-current?filename=' + encodeURIComponent(currentFile) + '&n=50';
+            fetch(url).then(r => r.json()).then(data => {
+                const sel = document.getElementById('uc1ImageSelect');
+                sel.innerHTML = '<option value="">-- select image sample --</option>';
+                (data.images || []).forEach(function(img) {
+                    const opt = document.createElement('option');
+                    opt.value = img.path;
+                    opt.textContent = '#' + img.index + ' — ' + (img.label || img.path);
+                    opt.dataset.source = 'uploaded';
+                    sel.appendChild(opt);
+                });
+                if (!data.images || data.images.length === 0) {
+                    sel.innerHTML = '<option value="">No images found in dataset</option>';
+                }
+            }).catch(function() {
+                document.getElementById('uc1ImageSelect').innerHTML = '<option value="">Failed to load images</option>';
+            });
+        }
+
+        function loadUC1Image() {
+            const sel = document.getElementById('uc1ImageSelect');
+            if (!sel.value) return;
+            const path = sel.value.split('/').map(function(p) { return encodeURIComponent(p); }).join('/');
+            const primary = '/api/xai/uc1/uploaded-image/' + path;
+            const fallbackPath = '/api/xai/uc1/image/' + path;
+            const box = document.getElementById('uc1ImageBox');
+            box.innerHTML = '';
+            const img = document.createElement('img');
+            img.style.maxWidth = '100%';
+            img.style.maxHeight = '400px';
+            img.onerror = function() {
+                img.onerror = null;
+                img.src = fallbackPath;
+            };
+            img.src = primary;
+            box.appendChild(img);
+        }
+
+        function getUC1ImageRef() {
+            const sel = document.getElementById('uc1ImageSelect');
+            const v = sel && sel.value;
+            if (!v) return '';
+            if (v.startsWith('train/')) {
+                return 'minio://uc1-robotics/' + v;
+            }
+            return 'minio://uc1-robotics/' + PSX_USER_ID + '/' + v;
+        }
+
+        function runUC1Predict() {
+            const ref = getUC1ImageRef();
+            if (!ref) return alert('Select an image first');
+            showXAISpinner('Running object detection...');
+            fetch('/api/xai/uc1/predict', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({image_ref: ref}) })
+                .then(r => r.json()).then(data => {
+                    hideXAISpinner();
+                    const dets = (data.detections || [[]])[0];
+                    if (!dets.length) { document.getElementById('uc1DetTable').innerHTML = '<em>No detections found</em>'; return; }
+                    let html = '<table style="width:100%; border-collapse:collapse; font-size:0.8rem;">';
+                    html += '<tr style="background:#f0f0f0;"><th style="padding:4px;">#</th><th>Class</th><th>Conf</th><th>BBox</th></tr>';
+                    dets.forEach((d, i) => {
+                        html += '<tr><td style="padding:4px; text-align:center;">' + i + '</td><td>' + d.class_name + '</td><td>' + d.confidence.toFixed(3) + '</td><td>[' + d.bbox.map(v => v.toFixed(2)).join(', ') + ']</td></tr>';
+                    });
+                    html += '</table>';
+                    document.getElementById('uc1DetTable').innerHTML = html;
+                }).catch(e => { hideXAISpinner(); alert('Prediction failed: ' + e.message); });
+        }
+
+        function runUC1Saliency() {
+            const ref = getUC1ImageRef();
+            if (!ref) return alert('Select an image first');
+            const ps = document.getElementById('uc1PatchStride').value.split(',');
+            showXAISpinner('Computing saliency (may take 30s+)...');
+            fetch('/api/xai/uc1/saliency', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({
+                    image_ref: ref,
+                    detection_index: parseInt(document.getElementById('uc1DetIdx').value),
+                    patch_size: parseInt(ps[0]),
+                    stride: parseInt(ps[1]),
+                    iou_thres: parseFloat(document.getElementById('uc1IoU').value)
+                })
+            }).then(r => r.json()).then(data => {
+                hideXAISpinner();
+                if (data.error) { document.getElementById('uc1SaliencyBox').innerHTML = '<span style="color:red;">' + data.error + '</span>'; return; }
+                document.getElementById('uc1SaliencyBox').innerHTML = '<img src="data:image/png;base64,' + data.result + '" style="max-width:100%; max-height:400px;">';
+                document.getElementById('uc1StorageRef').textContent = data.storage_ref || '';
+            }).catch(e => { hideXAISpinner(); alert('Saliency failed: ' + e.message); });
+        }
+
+        // ── UC2 ──
+        function loadUC2Samples() {
+            fetch('/api/xai/persample/samples?n=50')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.error) {
+                        document.getElementById('uc2TextBox').textContent = data.error;
+                        return;
+                    }
+                    xaiSamples = data.samples || [];
+                    var maxIdx = Math.max(0, xaiSamples.length - 1);
+                    document.getElementById('uc2MaxLabel').textContent = maxIdx;
+                    document.getElementById('uc2SampleIdx').max = maxIdx;
+                    if (xaiSamples.length > 0) {
+                        loadUC2Sample(0);
+                        exportForXAI();
+                    } else {
+                        document.getElementById('uc2TextBox').textContent = 'No text samples found in this dataset.';
+                    }
+                })
+                .catch(function(err) {
+                    document.getElementById('uc2TextBox').textContent = 'Failed to load samples. Make sure data is uploaded and ingested first.';
+                });
+        }
+
+        function exportForXAI() {
+            fetch('/api/xai/persample/export-csv', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.text_ref) {
+                        xaiTextRef = data.text_ref;
+                        console.log('XAI export ready:', xaiTextRef);
+                    }
+                })
+                .catch(function(err) { console.warn('Export for XAI failed:', err); });
+        }
+
+        function loadUC2Sample(idx) {
+            idx = parseInt(idx);
+            document.getElementById('uc2IdxLabel').textContent = idx;
+            document.getElementById('uc2SampleIdx').value = idx;
+            if (idx < xaiSamples.length) {
+                var s = xaiSamples[idx];
+                document.getElementById('uc2TextBox').textContent = s.text || '(empty)';
+                var label = s.sentiment || '';
+                var asset = s.asset ? ' | Asset: ' + s.asset : '';
+                document.getElementById('uc2TrueLabel').innerHTML = '<strong>Sentiment:</strong> ' + label + asset;
+            }
+            document.getElementById('uc2OcclusionResult').innerHTML = '';
+            document.getElementById('uc2LimeResult').innerHTML = '';
+            document.getElementById('uc2PredBar').style.display = 'none';
+        }
+
+        function runUC2Predict() {
+            const idx = parseInt(document.getElementById('uc2SampleIdx').value);
+            if (idx >= xaiSamples.length) return;
+            const text = xaiSamples[idx].text;
+            showXAISpinner('Running FinBERT prediction...');
+            fetch('/api/xai/uc2/predict', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text}) })
+                .then(r => r.json()).then(data => {
+                    hideXAISpinner();
+                    const p = (data.predictions || [{}])[0];
+                    document.getElementById('uc2PosScore').textContent = (p.positive || 0).toFixed(3);
+                    document.getElementById('uc2NegScore').textContent = (p.negative || 0).toFixed(3);
+                    document.getElementById('uc2NeuScore').textContent = (p.neutral || 0).toFixed(3);
+                    document.getElementById('uc2PredBar').style.display = 'block';
+                }).catch(e => { hideXAISpinner(); alert('Prediction failed: ' + e.message); });
+        }
+
+        function renderWordScores(container, wordScores, title, text) {
+            const maxScore = Math.max(...wordScores.map(w => Math.abs(w.importance)), 0.001);
+            // Inline highlighted text
+            let wordMap = {};
+            wordScores.forEach(w => { wordMap[w.word] = w.importance; });
+            const words = wordScores[0] && wordScores[0].index !== undefined
+                ? wordScores.sort((a,b) => a.index - b.index).map(w => w.word)
+                : text.split(' ');
+            let spans = words.map(word => {
+                const score = wordMap[word] || 0;
+                const intensity = Math.min(0.85, Math.max(0.15, Math.abs(score) / maxScore));
+                const color = score > 0 ? 'rgba(0,180,0,' + intensity.toFixed(2) + ')'
+                            : score < 0 ? 'rgba(220,0,0,' + intensity.toFixed(2) + ')'
+                            : 'transparent';
+                return '<span class="xai-word" style="background:' + color + ';" title="' + score.toFixed(4) + '">' + word + '</span>';
+            }).join(' ');
+
+            // Bar chart
+            const top15 = wordScores.sort((a,b) => Math.abs(b.importance) - Math.abs(a.importance)).slice(0, 15);
+            let bars = top15.map(w => {
+                const pct = Math.abs(w.importance) / maxScore * 100;
+                const clr = w.importance >= 0 ? '#2ecc71' : '#e74c3c';
+                return '<div style="display:flex; align-items:center; gap:6px; margin:2px 0;"><span style="width:70px; font-size:0.75rem; text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + w.word + '</span><div style="flex:1; height:14px; background:#f0f0f0; border-radius:3px;"><div style="width:' + pct + '%; height:100%; background:' + clr + '; border-radius:3px;"></div></div><span style="font-size:0.7rem; width:50px;">' + w.importance.toFixed(3) + '</span></div>';
+            }).join('');
+
+            container.innerHTML = '<h4 style="margin:0 0 8px 0;">' + title + '</h4>'
+                + '<div style="font-size:0.85rem; line-height:2.2; padding:10px; border:1px solid #ddd; border-radius:5px; background:#fafafa; margin-bottom:8px;">' + spans + '</div>'
+                + '<div style="font-size:0.75rem; color:#666; margin-bottom:8px;"><span style="background:rgba(0,180,0,0.6); padding:2px 6px; border-radius:3px;">supports</span> <span style="background:rgba(220,0,0,0.6); padding:2px 6px; border-radius:3px; color:#fff;">opposes</span></div>'
+                + bars;
+        }
+
+        function runUC2Occlusion() {
+            var idx = parseInt(document.getElementById('uc2SampleIdx').value);
+            if (idx >= xaiSamples.length) return alert('No sample selected');
+            if (!xaiTextRef) return alert('Dataset not exported yet. Please wait or reload the tab.');
+
+            showXAISpinner('Computing occlusion importance...');
+            fetch('/api/xai/uc2/occlusion', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ text_ref: xaiTextRef, sample_index: idx })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                hideXAISpinner();
+                if (data.error) {
+                    document.getElementById('uc2OcclusionResult').innerHTML = '<span style="color:red;">' + data.error + '</span>';
+                    return;
+                }
+                var res = data.result || {};
+                var text = xaiSamples[idx] ? xaiSamples[idx].text : '';
+                renderWordScores(document.getElementById('uc2OcclusionResult'), res.word_scores || [], 'Occlusion — ' + (res.target_class || ''), text);
+            })
+            .catch(function(e) { hideXAISpinner(); alert('Occlusion failed: ' + e.message); });
+        }
+
+        function runUC2Lime() {
+            var idx = parseInt(document.getElementById('uc2SampleIdx').value);
+            if (idx >= xaiSamples.length) return alert('No sample selected');
+            if (!xaiTextRef) return alert('Dataset not exported yet. Please wait or reload the tab.');
+            var numF = parseInt(document.getElementById('uc2LimeFeatures').value);
+            var numS = parseInt(document.getElementById('uc2LimeSamples').value);
+
+            showXAISpinner('Computing LIME (may take 20s)...');
+            fetch('/api/xai/uc2/lime', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ text_ref: xaiTextRef, sample_index: idx, num_features: numF, num_samples: numS })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                hideXAISpinner();
+                if (data.error) {
+                    document.getElementById('uc2LimeResult').innerHTML = '<span style="color:red;">' + data.error + '</span>';
+                    return;
+                }
+                var res = data.result || {};
+                var text = xaiSamples[idx] ? xaiSamples[idx].text : '';
+                renderWordScores(document.getElementById('uc2LimeResult'), res.word_scores || [], 'LIME — ' + (res.target_class || ''), text);
+            })
+            .catch(function(e) { hideXAISpinner(); alert('LIME failed: ' + e.message); });
+        }
+        </script>
+
         
         <!-- Floating Chat Widget -->
         <button class="chat-fab" id="chatFab" onclick="toggleChat()" title="AI Assistant">

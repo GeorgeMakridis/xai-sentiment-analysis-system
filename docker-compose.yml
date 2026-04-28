@@ -59,6 +59,8 @@ services:
     depends_on:
       - xai_service
       - ai_outputs
+      - xai_api
+      - model_mock
     environment:
       - XAI_SERVICE_URL=${XAI_SERVICE_URL:-http://xai_service:8000}
       - AI_OUTPUTS_SERVICE_URL=${AI_OUTPUTS_SERVICE_URL:-http://ai_outputs:8001}
@@ -80,6 +82,11 @@ services:
       - LEGACY_ADMIN_PW=${LEGACY_ADMIN_PW:-changeme}
       - LEGACY_ANALYST_PW=${LEGACY_ANALYST_PW:-changeme}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - XAI_API_URL=${XAI_API_URL:-http://xai_api:8000}
+      - MODEL_API_URL=${MODEL_API_URL:-http://model_mock:8003}
+      - UC1_BUCKET=${UC1_BUCKET:-uc1-robotics}
+      - UC2_BUCKET=${UC2_BUCKET:-uc2-finance}
+      - UC2_CSV_OBJECT=${UC2_CSV_OBJECT:-datasets/sentiment_annotated_with_texts.csv}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 30s
@@ -149,6 +156,45 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+    networks:
+      - app-network
+
+  # ── Per-Sample XAI API (FastAPI) ─────────────────────────────────
+  xai_api:
+    build: ./services/xai-api
+    ports:
+      - "8003:8000"
+    environment:
+      - MODEL_API_URL=http://model_mock:8003
+      - RESTFS_ENDPOINT=${RESTFS_ENDPOINT:-rustfs.extra-brain.unparallel.pt}
+      - RESTFS_ACCESS_KEY=${RESTFS_ACCESS_KEY}
+      - RESTFS_SECRET_KEY=${RESTFS_SECRET_KEY}
+      - RESTFS_SECURE=${RESTFS_SECURE:-true}
+      - UC1_BUCKET=${UC1_BUCKET:-uc1-robotics}
+      - UC2_BUCKET=${UC2_BUCKET:-uc2-finance}
+      - RESULTS_PREFIX=${RESULTS_PREFIX:-results}
+    depends_on:
+      - model_mock
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - app-network
+
+  # ── Model Mock API (YOLO + FinBERT) ────────────────────────────
+  model_mock:
+    build: ./services/model-mock
+    ports:
+      - "8004:8003"
+    volumes:
+      - ./models:/models:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     networks:
       - app-network
 

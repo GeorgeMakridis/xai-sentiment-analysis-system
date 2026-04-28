@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+minio
+requests
+lime
+pandas
+numpy
+scipy
+pillow
+matplotlib
