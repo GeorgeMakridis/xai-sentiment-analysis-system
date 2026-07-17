@@ -177,6 +177,13 @@ def load_news_sentiment_data(file_path):
 def load_data(file_path):
     """Load data from various file formats"""
     try:
+        if os.path.isdir(file_path):
+            from image_folder_loader import load_image_folder_dataset, is_image_folder
+
+            if not is_image_folder(file_path):
+                raise ValueError(f"Directory does not contain a supported image dataset: {file_path}")
+            df, _info = load_image_folder_dataset(file_path, uploads_root=UPLOAD_FOLDER)
+            return df
         if file_path.endswith('.csv'):
             return pd.read_csv(file_path)
         elif file_path.endswith('.json'):
@@ -338,18 +345,35 @@ def ingest_data():
             return jsonify({'error': 'Missing file_path or user_id'}), 400
         
         print(f"Ingesting data for user {user_id}: {file_path}")
-        
-        # Load data
-        df = load_data(file_path)
-        print(f"Loaded data shape: {df.shape}")
-        
-        # Detect data type if auto
-        if data_type == 'auto':
-            data_type_info = detect_data_type(df)
-            data_type = data_type_info['type']
-            print(f"Detected data type: {data_type} (confidence: {data_type_info['confidence']})")
+
+        folder_ingest = os.path.isdir(file_path)
+        folder_preprocessing = None
+        if folder_ingest:
+            from image_folder_loader import load_image_folder_dataset, is_image_folder
+
+            if not is_image_folder(file_path):
+                return jsonify({'error': 'Directory is not a supported image dataset'}), 400
+            df, folder_preprocessing = load_image_folder_dataset(file_path, uploads_root=UPLOAD_FOLDER)
+            data_type = 'image'
+            data_type_info = {
+                'type': 'image',
+                'confidence': 1.0,
+                'features': {'image_columns': ['image_path']},
+                'preprocessing_needed': [],
+            }
+            print(f"Loaded image folder dataset shape: {df.shape}")
         else:
-            data_type_info = detect_data_type(df)
+            # Load data
+            df = load_data(file_path)
+            print(f"Loaded data shape: {df.shape}")
+
+            # Detect data type if auto
+            if data_type == 'auto':
+                data_type_info = detect_data_type(df)
+                data_type = data_type_info['type']
+                print(f"Detected data type: {data_type} (confidence: {data_type_info['confidence']})")
+            else:
+                data_type_info = detect_data_type(df)
         
         # Preprocess based on data type
         if data_type == 'timeseries':
@@ -376,11 +400,16 @@ def ingest_data():
             # For image data, keep original structure but add metadata
             df_processed = df.copy()
             image_columns = data_type_info.get('features', {}).get('image_columns', [])
-            preprocessing_info = {
-                'data_type': 'image',
-                'image_columns': image_columns,
-                'preprocessing_steps': ['image_validation', 'metadata_extraction']
-            }
+            if folder_preprocessing:
+                preprocessing_info = dict(folder_preprocessing)
+                if image_columns:
+                    preprocessing_info['image_columns'] = image_columns
+            else:
+                preprocessing_info = {
+                    'data_type': 'image',
+                    'image_columns': image_columns or ['image_path'],
+                    'preprocessing_steps': ['image_validation', 'metadata_extraction']
+                }
         else:  # tabular
             df_processed = df.copy()
             preprocessing_info = {
@@ -553,292 +582,223 @@ def data_statistics():
                 from datetime import datetime
                 import base64
                 import io
-                
-                # Import ImagePlotGenerator
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt
+                from PIL import Image as PILImage
+
                 from plot_generators.registry import PlotGeneratorRegistry
                 generator = PlotGeneratorRegistry.get_generator('image')
-                
+
                 user_results_dir = f"/app/shared_data/results/{user_id}"
                 os.makedirs(user_results_dir, exist_ok=True)
-                
-                # Clear old image statistics files
+
                 import glob
                 old_files = glob.glob(os.path.join(user_results_dir, "image_*.png"))
                 for old_file in old_files:
                     try:
                         os.remove(old_file)
-                    except:
+                    except Exception:
                         pass
-                
+
+                preprocessing_info = user_data.get('preprocessing_info') or {}
+                dataset_format = preprocessing_info.get('dataset_format', '')
+                is_folder_dataset = dataset_format in ('yolo', 'image_folder')
+                label_col = generator._resolve_label_column(df)
+                image_cols = generator._find_image_columns(df)
                 base64_images = []
-                
-                # 1. Enhanced Image Statistics (with color channels & quality metrics)
-                try:
-                    plot_spec = {'plot_type': 'image_statistics', 'title': '📸 Image Statistics'}
-                    fig = generator._create_image_statistics(df, plot_spec, 'Image Statistics')
-                    # Note: _create_image_statistics already calls _add_image_data_indicator internally at line 970
-                    
-                    # Convert Plotly figure to PNG using kaleido
+
+                def _append_plotly(fig, plot_type, width=1400, height=900):
+                    if fig is None:
+                        return
+                    if isinstance(fig, dict) and fig.get('type') == 'html_grid':
+                        return
                     try:
-                        img_bytes = fig.to_image(format="png", width=1400, height=1000, scale=2)
+                        img_bytes = fig.to_image(format="png", width=width, height=height, scale=2)
                         base64_images.append({
-                            'type': 'image_statistics',
-                            'image': base64.b64encode(img_bytes).decode()
+                            'type': plot_type,
+                            'image': base64.b64encode(img_bytes).decode(),
+                            'title': plot_type.replace('_', ' ').title(),
                         })
-                        print("✓ Generated enhanced image statistics plot")
+                        print(f"✓ Generated {plot_type}")
                     except Exception as e:
-                        print(f"Could not convert image_statistics to PNG with kaleido: {e}")
-                        print("Trying matplotlib-based approach...")
-                        # Fallback: Use matplotlib to render the plot data directly
-                        try:
-                            import matplotlib.pyplot as plt
-                            import matplotlib
-                            matplotlib.use('Agg')
-                            
-                            # Extract data from the Plotly figure and create matplotlib version
-                            # For now, create a simpler version using the actual image data
-                            image_cols = generator._find_image_columns(df)
-                            if image_cols:
-                                # Create a simplified statistics plot with matplotlib
-                                fig_mpl, axes = plt.subplots(2, 2, figsize=(14, 10))
-                                
-                                # Get label column
-                                label_col = None
-                                for col in df.columns:
-                                    if any(term in col.lower() for term in ['label', 'class', 'category', 'digit']):
-                                        label_col = col
-                                        break
-                                
-                                if label_col:
-                                    # Plot 1: Class distribution
-                                    class_counts = df[label_col].value_counts().sort_index()
-                                    axes[0, 0].bar(range(len(class_counts)), class_counts.values, color='steelblue', alpha=0.7)
-                                    axes[0, 0].set_xticks(range(len(class_counts)))
-                                    axes[0, 0].set_xticklabels(class_counts.index, rotation=45, ha='right')
-                                    axes[0, 0].set_xlabel('Class')
-                                    axes[0, 0].set_ylabel('Count')
-                                    axes[0, 0].set_title('Class Distribution')
-                                    axes[0, 0].grid(True, alpha=0.3, axis='y')
-                                
-                                # Plot 2: Dataset info
-                                axes[0, 1].axis('off')
-                                info_text = f"""📸 Image Dataset Statistics
+                        print(f"Could not convert {plot_type} to PNG: {e}")
 
-Total Images: {len(df)}
-Classes: {df[label_col].nunique() if label_col else 'N/A'}
-Columns: {len(df.columns)}
+                def _append_mpl(fig, plot_type):
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format='png', dpi=160, bbox_inches='tight')
+                    plt.close(fig)
+                    buf.seek(0)
+                    base64_images.append({
+                        'type': plot_type,
+                        'image': base64.b64encode(buf.read()).decode(),
+                        'title': plot_type.replace('_', ' ').title(),
+                    })
+                    print(f"✓ Generated {plot_type}")
 
-Image Columns: {', '.join(image_cols[:3]) if image_cols else 'None'}
-"""
-                                axes[0, 1].text(0.1, 0.5, info_text, fontsize=12, verticalalignment='center',
-                                               bbox=dict(boxstyle="round,pad=1", facecolor="lightblue", alpha=0.8))
-                                
-                                # Plot 3 & 4: Placeholder for future stats
-                                axes[1, 0].axis('off')
-                                axes[1, 0].text(0.5, 0.5, '📸 IMAGE DATA\nEnhanced statistics available\nvia chat: "Show image statistics"', 
-                                               ha='center', va='center', fontsize=14,
-                                               bbox=dict(boxstyle="round,pad=1", facecolor="lightgreen", alpha=0.8))
-                                
-                                axes[1, 1].axis('off')
-                                axes[1, 1].text(0.5, 0.5, 'Use interactive chat to generate:\n• Color channel statistics\n• Quality metrics\n• Class separability', 
-                                               ha='center', va='center', fontsize=12,
-                                               bbox=dict(boxstyle="round,pad=1", facecolor="lightyellow", alpha=0.8))
-                                
-                                plt.suptitle('📸 Image Statistics Overview', fontsize=16, fontweight='bold', y=0.98)
-                                plt.tight_layout()
-                                
-                                img_buffer = io.BytesIO()
-                                plt.savefig(img_buffer, format='png', dpi=200, bbox_inches='tight')
-                                plt.close()
-                                img_buffer.seek(0)
-                                base64_images.append({
-                                    'type': 'image_statistics',
-                                    'image': base64.b64encode(img_buffer.read()).decode()
-                                })
-                                print("✓ Generated matplotlib-based image statistics plot")
-                            else:
-                                print("No image columns found for statistics")
-                        except Exception as e2:
-                            print(f"Matplotlib fallback also failed: {e2}")
-                            import traceback
-                            traceback.print_exc()
-                except Exception as e:
-                    print(f"Image statistics plot failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-                
-                # 2. Embedding Visualization (using ResNet18 pre-trained model - small & efficient)
+                # 1) Dataset overview
                 try:
-                    label_col = None
-                    for col in df.columns:
-                        if any(term in col.lower() for term in ['label', 'class', 'category', 'digit']):
-                            label_col = col
-                            break
-                    
-                    if label_col:
-                        print("Generating embedding visualization using ResNet18 (ImageNet pre-trained)...")
-                        plot_spec = {'plot_type': 'embedding_visualization', 'title': 'Image Embedding Visualization (ResNet18)'}
-                        fig = generator._create_embedding_visualization(df, plot_spec, 'Embedding Space')
-                        # Note: _create_embedding_visualization already calls _add_image_data_indicator internally
-                        
-                        try:
-                            img_bytes = fig.to_image(format="png", width=1400, height=800, scale=2)
-                            base64_images.append({
-                                'type': 'embedding_visualization',
-                                'image': base64.b64encode(img_bytes).decode()
-                            })
-                            print("✓ Generated embedding visualization (ResNet18 pre-trained)")
-                        except Exception as e:
-                            print(f"Could not convert embedding_visualization to PNG: {e}")
-                            # Skip fallback for this one - it requires the model
+                    fig = generator._create_dataset_overview(df, {'plot_type': 'dataset_overview'}, 'Dataset Overview')
+                    _append_plotly(fig, 'dataset_overview', width=1200, height=700)
                 except Exception as e:
-                    print(f"Embedding visualization plot failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-                
-                # 3. Class Separability (using ResNet18 embeddings - pre-trained model)
+                    print(f"dataset_overview failed: {e}")
+
+                # 2) Class distribution (expand multi-label for YOLO when available)
                 try:
-                    if label_col:
-                        print("Generating class separability using ResNet18 embeddings...")
-                        plot_spec = {'plot_type': 'class_separability', 'title': 'Class Separability Analysis (ResNet18)'}
-                        fig = generator._create_class_separability(df, plot_spec, 'Class Separability')
-                        # Note: _create_class_separability already calls _add_image_data_indicator internally at line 1302
-                        
-                        try:
-                            img_bytes = fig.to_image(format="png", width=1400, height=1200, scale=2)
-                            base64_images.append({
-                                'type': 'class_separability',
-                                'image': base64.b64encode(img_bytes).decode()
-                            })
-                            print("✓ Generated enhanced class separability plot (ResNet18 pre-trained)")
-                        except Exception as e:
-                            print(f"Could not convert class_separability to PNG with kaleido: {e}")
-                    else:
-                        print("No label column found for class separability")
+                    multi = generator.expand_multilabel_counts(df)
+                    if multi is not None and len(multi) > 0:
+                        fig = go.Figure(data=[go.Bar(
+                            x=[str(i) for i in multi.index.tolist()],
+                            y=multi.values.tolist(),
+                            marker_color='steelblue',
+                            text=multi.values.tolist(),
+                            textposition='outside',
+                        )])
+                        fig.update_layout(
+                            title='📸 Class / Label Occurrence Distribution',
+                            xaxis_title='Class',
+                            yaxis_title='Count (images containing label)',
+                            template='plotly_white',
+                            height=500,
+                        )
+                        _append_plotly(fig, 'image_classification', width=1200, height=600)
+                    elif label_col:
+                        fig = generator._create_classification_distribution(
+                            df, {'plot_type': 'classification_distribution'}, 'Class Distribution'
+                        )
+                        _append_plotly(fig, 'image_classification', width=1200, height=600)
                 except Exception as e:
-                    print(f"Class separability plot failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-                
-                # 3b. Class Similarity Matrix (NEW - using ResNet18)
+                    print(f"class distribution failed: {e}")
+
+                # 3) Train/valid/test split (YOLO / folder)
+                if 'split' in df.columns:
+                    try:
+                        fig = generator._create_train_test_distribution(
+                            df, {'plot_type': 'train_test_distribution'}, 'Train / Valid / Test Split'
+                        )
+                        _append_plotly(fig, 'train_test_distribution', width=1200, height=600)
+                    except Exception as e:
+                        print(f"train_test_distribution failed: {e}")
+
+                # 4) Objects per image (YOLO)
+                if 'num_objects' in df.columns:
+                    try:
+                        fig = go.Figure(data=[go.Histogram(
+                            x=df['num_objects'].tolist(),
+                            nbinsx=20,
+                            marker_color='#2F5496',
+                        )])
+                        fig.update_layout(
+                            title='📸 Objects per Image',
+                            xaxis_title='Number of labeled objects',
+                            yaxis_title='Image count',
+                            template='plotly_white',
+                            height=450,
+                        )
+                        _append_plotly(fig, 'objects_per_image', width=1100, height=500)
+                    except Exception as e:
+                        print(f"objects_per_image failed: {e}")
+
+                # 5) Real image statistics (path or base64)
                 try:
-                    if label_col:
-                        print("Generating inter-class similarity matrix using ResNet18...")
-                        plot_spec = {'plot_type': 'class_similarity_matrix', 'title': 'Inter-Class Similarity (ResNet18)'}
-                        fig = generator._create_class_similarity_matrix(df, plot_spec, 'Class Similarity')
-                        
-                        try:
-                            img_bytes = fig.to_image(format="png", width=1400, height=800, scale=2)
-                            base64_images.append({
-                                'type': 'class_similarity_matrix',
-                                'image': base64.b64encode(img_bytes).decode()
-                            })
-                            print("✓ Generated class similarity matrix (ResNet18 pre-trained)")
-                        except Exception as e:
-                            print(f"Could not convert class_similarity_matrix to PNG: {e}")
-                    else:
-                        print("No label column found for class similarity matrix")
+                    fig = generator._create_image_statistics(
+                        df, {'plot_type': 'image_statistics'}, 'Image Statistics'
+                    )
+                    _append_plotly(fig, 'image_statistics', width=1400, height=1000)
                 except Exception as e:
-                    print(f"Class similarity matrix plot failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-                
-                # 4. Image Grid (Sample Images)
+                    print(f"image_statistics failed: {e}")
+
+                # 6) Sample image grid from paths / base64
                 try:
-                    image_cols = generator._find_image_columns(df)
-                    if image_cols and label_col:
-                        plot_spec = {'plot_type': 'image_grid', 'title': 'Sample Images by Class'}
-                        # Use the generator's image grid method
-                        html_content = generator._create_image_grid(df, plot_spec, 'Sample Images')
-                        # For automatic display, create a simple matplotlib version
-                        import matplotlib.pyplot as plt
-                        import matplotlib
-                        matplotlib.use('Agg')
-                        from PIL import Image as PILImage
-                        
+                    if image_cols:
                         image_col = image_cols[0]
-                        fig, axes = plt.subplots(2, 5, figsize=(15, 6))
+                        classes = []
+                        if label_col:
+                            classes = list(df[label_col].dropna().astype(str).unique())
+                        classes = sorted(classes)[:10] if classes else [None]
+                        n_show = min(10, max(1, len(classes)))
+                        fig_mpl, axes = plt.subplots(2, 5, figsize=(15, 6))
                         axes = axes.ravel()
-                        
-                        sample_count = 0
-                        for label in sorted(df[label_col].unique())[:10]:
-                            if sample_count >= 10:
+                        shown = 0
+                        for cls in classes:
+                            if shown >= n_show:
                                 break
-                            sample = df[df[label_col] == label].head(1)
-                            if len(sample) > 0:
-                                try:
-                                    img_data = str(sample[image_col].iloc[0])
-                                    if img_data.startswith('data:image') or img_data.startswith('iVBORw0KGgo'):
-                                        base64_data = img_data.split(',')[1] if ',' in img_data else img_data
-                                        img_bytes = base64.b64decode(base64_data)
-                                        img = PILImage.open(io.BytesIO(img_bytes))
-                                        axes[sample_count].imshow(img, cmap='gray' if img.mode == 'L' else None)
-                                        axes[sample_count].set_title(f'Class: {label}', fontsize=10)
-                                        axes[sample_count].axis('off')
-                                        sample_count += 1
-                                except Exception as e:
-                                    print(f"Could not display image for class {label}: {e}")
-                        
-                        for i in range(sample_count, 10):
+                            subset = df if cls is None else df[df[label_col].astype(str) == cls]
+                            img = None
+                            for _, row in subset.head(8).iterrows():
+                                img = generator._load_pil_image(row[image_col], convert_rgb=True)
+                                if img is not None:
+                                    break
+                            if img is None:
+                                axes[shown].axis('off')
+                                axes[shown].set_title(f'{cls or "sample"} (missing)', fontsize=9)
+                                shown += 1
+                                continue
+                            axes[shown].imshow(img)
+                            axes[shown].set_title(f'Class: {cls}' if cls is not None else 'Sample', fontsize=10)
+                            axes[shown].axis('off')
+                            shown += 1
+                        for i in range(shown, 10):
                             axes[i].axis('off')
-                        
                         plt.suptitle('📸 Sample Images by Class', fontsize=14, fontweight='bold', y=1.02)
                         plt.tight_layout()
-                        
-                        img_buffer = io.BytesIO()
-                        plt.savefig(img_buffer, format='png', dpi=200, bbox_inches='tight')
-                        plt.close()
-                        img_buffer.seek(0)
-                        base64_images.append({
-                            'type': 'image_grid',
-                            'image': base64.b64encode(img_buffer.read()).decode()
-                        })
-                        print("✓ Generated image grid plot")
+                        _append_mpl(fig_mpl, 'image_grid')
                 except Exception as e:
                     print(f"Image grid plot failed: {e}")
-                
+                    import traceback
+                    traceback.print_exc()
+
+                # 7) Optional ResNet analytics (skip by default for large YOLO folders unless requested)
+                run_heavy = (not is_folder_dataset) or bool(plot_types)
+                if run_heavy and label_col:
+                    for plot_type, builder, title in (
+                        ('embedding_visualization', generator._create_embedding_visualization, 'Embedding Space'),
+                        ('class_separability', generator._create_class_separability, 'Class Separability'),
+                        ('class_similarity_matrix', generator._create_class_similarity_matrix, 'Class Similarity'),
+                    ):
+                        if plot_types and plot_type not in plot_types and not generate_all:
+                            continue
+                        try:
+                            fig = builder(df, {'plot_type': plot_type}, title)
+                            _append_plotly(fig, plot_type, width=1400, height=800)
+                        except Exception as e:
+                            print(f"{plot_type} failed: {e}")
+
                 if len(base64_images) == 0:
-                    print("WARNING: No image visualizations generated, creating fallback...")
-                    # Create a simple fallback plot
                     try:
-                        plt.figure(figsize=(10, 6))
-                        plt.text(0.5, 0.5, f'Image Data Loaded\nTotal Images: {len(df)}\nColumns: {", ".join(df.columns[:10])}', 
-                                ha='center', va='center', fontsize=12, transform=plt.gca().transAxes,
-                                bbox=dict(boxstyle="round,pad=1", facecolor="lightblue", alpha=0.8))
+                        fig = plt.figure(figsize=(10, 6))
+                        plt.text(
+                            0.5, 0.5,
+                            f'Image Data Loaded\nTotal Images: {len(df)}\nColumns: {", ".join(map(str, df.columns[:10]))}',
+                            ha='center', va='center', fontsize=12,
+                            transform=plt.gca().transAxes,
+                            bbox=dict(boxstyle="round,pad=1", facecolor="lightblue", alpha=0.8),
+                        )
                         plt.title('📸 Image Data Overview', fontsize=14, fontweight='bold')
                         plt.axis('off')
-                        fallback_path = os.path.join(user_results_dir, f"image_fallback_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
-                        plt.savefig(fallback_path, dpi=200, bbox_inches='tight')
-                        plt.close()
-                        with open(fallback_path, 'rb') as f:
-                            img_data = base64.b64encode(f.read()).decode()
-                        base64_images.append({
-                            'type': 'image_overview',
-                            'image': img_data
-                        })
-                        print("✓ Created fallback image plot")
+                        _append_mpl(fig, 'image_overview')
                     except Exception as e:
-                        print(f"ERROR: Failed to create fallback: {e}")
                         return jsonify({
                             'user_id': user_id,
                             'data_type': data_type,
                             'images': [],
                             'error': f'Failed to generate image visualizations: {str(e)}'
                         }), 500
-                
+
                 print(f"DEBUG: Generated {len(base64_images)} image visualizations")
                 print(f"DEBUG: Image types: {[img.get('type', 'unknown') for img in base64_images]}")
                 return jsonify({
                     'user_id': user_id,
                     'data_type': data_type,
                     'images': base64_images,
+                    'data_shape': list(df.shape),
+                    'columns_count': len(df.columns),
                     'message': f'Image data statistics generated successfully - {len(base64_images)} visualizations'
                 })
             except Exception as e:
                 print(f"ERROR in image data statistics: {e}")
                 import traceback
                 traceback.print_exc()
-                # Return error instead of falling through
                 return jsonify({
                     'user_id': user_id,
                     'data_type': data_type,

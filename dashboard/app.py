@@ -12,6 +12,7 @@ import logging
 from datetime import datetime
 import io
 import uuid
+import zipfile
 from typing import Optional, Tuple
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -20,6 +21,14 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 # Add parent dir to path so `auth` package is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from auth import init_auth, login_required, role_required, get_current_user
+from image_folder_utils import (
+    collect_images_from_folder,
+    folder_size,
+    is_image_folder,
+    save_manifest_csv,
+    unzip_bytes_to_folder,
+    zip_folder_to_bytes,
+)
 
 # ── App setup ────────────────────────────────────────────────────────────────
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -80,6 +89,86 @@ def _proxy_get(url: str, params: dict = None, timeout: int = 15):
     return requests.get(url, params=params, headers=_auth_headers(), timeout=timeout)
 
 
+def _list_local_datasets():
+    """Scan uploads for tabular files and image-folder datasets."""
+    datasets = []
+    if not os.path.isdir(UPLOAD_FOLDER):
+        return datasets
+    for fname in os.listdir(UPLOAD_FOLDER):
+        fpath = os.path.join(UPLOAD_FOLDER, fname)
+        if os.path.isfile(fpath) and fname.endswith((".csv", ".json", ".txt")):
+            if fname.endswith("_manifest.csv"):
+                continue
+            datasets.append({
+                "filename": fname,
+                "key": fpath,
+                "size": os.path.getsize(fpath),
+                "source": "local",
+                "dataset_type": "file",
+            })
+        elif os.path.isdir(fpath) and is_image_folder(fpath):
+            datasets.append({
+                "filename": fname,
+                "key": fpath,
+                "size": folder_size(fpath),
+                "source": "local",
+                "dataset_type": "folder",
+            })
+    return datasets
+
+
+def _resolve_dataset_path(filename: str) -> str:
+    """Return local path for a dataset file or image folder name."""
+    folder_candidate = os.path.join(UPLOAD_FOLDER, filename)
+    if os.path.isdir(folder_candidate):
+        return folder_candidate
+    return os.path.join(UPLOAD_FOLDER, secure_filename(filename))
+
+
+def _store_dataset_to_restfs(filename: str, dataset_type: str = "file"):
+    """Persist dataset file or image folder to RustFS."""
+    try:
+        import base64 as b64mod
+
+        payload = {
+            "user_id": _user_id(),
+            "filename": filename,
+            "dataset_type": dataset_type,
+        }
+        if dataset_type == "folder":
+            folder_path = os.path.join(UPLOAD_FOLDER, filename)
+            if os.path.isdir(folder_path):
+                payload["zip_bytes_b64"] = b64mod.b64encode(
+                    zip_folder_to_bytes(folder_path)
+                ).decode("ascii")
+                manifest_path = save_manifest_csv(folder_path, UPLOAD_FOLDER)
+                if manifest_path:
+                    payload["manifest_filename"] = os.path.basename(manifest_path)
+        _proxy_post(f"{AI_OUTPUTS_SERVICE_URL}/api/store-dataset", payload, timeout=120)
+    except Exception as e:
+        logger.warning("Failed to persist dataset to RustFS: %s", e)
+
+
+def _fetch_dataset_from_restfs(filename: str, dataset_type: str = "file") -> Tuple[Optional[str], str]:
+    """Fetch dataset from RustFS. Returns (local_path, error)."""
+    try:
+        resp = _proxy_post(
+            f"{AI_OUTPUTS_SERVICE_URL}/api/fetch-dataset",
+            {
+                "user_id": _user_id(),
+                "filename": filename,
+                "dataset_type": dataset_type,
+            },
+            timeout=120,
+        )
+        if resp.status_code != 200:
+            err = (resp.json() or {}).get("error", resp.text)
+            return None, str(err)
+        return resp.json().get("file_path"), ""
+    except Exception as e:
+        return None, str(e)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Routes
 # ═════════════════════════════════════════════════════════════════════════════
@@ -124,13 +213,7 @@ def upload_data():
             result = resp.json()
 
             # Persist dataset to RustFS so it survives container restarts
-            try:
-                _proxy_post(f"{AI_OUTPUTS_SERVICE_URL}/api/store-dataset", {
-                    "user_id": _user_id(),
-                    "filename": filename,
-                }, timeout=30)
-            except Exception as e:
-                logger.warning("Failed to persist dataset to RustFS: %s", e)
+            _store_dataset_to_restfs(filename, dataset_type="file")
 
             return jsonify({
                 "message": "Data uploaded and ingested successfully",
@@ -141,6 +224,82 @@ def upload_data():
     except Exception as e:
         logger.exception("upload_data failed")
         return jsonify({"error": f"Ingestion failed: {e}"}), 500
+
+
+@app.route("/api/upload-image-dataset", methods=["POST"])
+@login_required
+@role_required("analyst", "admin")
+def upload_image_dataset():
+    """Upload an image folder (multipart files with relative paths) or a .zip dataset."""
+    try:
+        dataset_name = (request.form.get("dataset_name") or "").strip()
+        uploaded_zip = request.files.get("zip_file")
+        relative_files = request.files.getlist("files")
+
+        if uploaded_zip and uploaded_zip.filename:
+            safe_zip = secure_filename(uploaded_zip.filename)
+            if not safe_zip.lower().endswith(".zip"):
+                return jsonify({"error": "Image dataset upload requires a .zip archive"}), 400
+            if not dataset_name:
+                dataset_name = safe_zip[:-4] if safe_zip.lower().endswith(".zip") else safe_zip
+            dataset_name = secure_filename(dataset_name) or "image_dataset"
+            zip_bytes = uploaded_zip.read()
+            dest_folder = unzip_bytes_to_folder(zip_bytes, UPLOAD_FOLDER, dataset_name)
+            if not is_image_folder(dest_folder):
+                return jsonify({"error": "Zip does not contain a supported image dataset"}), 400
+            dataset_name = os.path.basename(dest_folder.rstrip(os.sep))
+        elif relative_files:
+            first_path = (request.form.get("paths") or "").split("\n")[0].strip()
+            if not first_path and relative_files[0].filename:
+                first_path = relative_files[0].filename
+            if not dataset_name and first_path:
+                dataset_name = first_path.replace("\\", "/").split("/")[0]
+            dataset_name = secure_filename(dataset_name) or "image_dataset"
+            dest_root = os.path.join(UPLOAD_FOLDER, dataset_name)
+            os.makedirs(dest_root, exist_ok=True)
+            for idx, f in enumerate(relative_files):
+                rel = f.filename or ""
+                paths_field = (request.form.get("paths") or "").split("\n")
+                if idx < len(paths_field) and paths_field[idx].strip():
+                    rel = paths_field[idx].strip()
+                rel = rel.replace("\\", "/").lstrip("/")
+                parts = [secure_filename(p) for p in rel.split("/") if p and p not in ("..", ".")]
+                if not parts:
+                    continue
+                if parts[0] == dataset_name:
+                    parts = parts[1:]
+                if not parts:
+                    continue
+                out_path = os.path.join(dest_root, *parts)
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                f.save(out_path)
+            dest_folder = dest_root
+            if not is_image_folder(dest_folder):
+                return jsonify({"error": "Uploaded folder does not contain images"}), 400
+        else:
+            return jsonify({"error": "No image dataset files provided"}), 400
+
+        file_path = dest_folder
+        resp = _proxy_post(f"{XAI_SERVICE_URL}/ingest", {
+            "file_path": file_path,
+            "user_id": _user_id(),
+            "data_type": "image",
+        })
+        if resp.status_code != 200:
+            return jsonify({"error": "Ingestion failed", "details": resp.text}), 500
+
+        result = resp.json()
+        _store_dataset_to_restfs(dataset_name, dataset_type="folder")
+
+        return jsonify({
+            "message": "Image dataset uploaded and ingested successfully",
+            "file_path": file_path,
+            "dataset_type": "folder",
+            "data_summary": result.get("data_summary", {}),
+        })
+    except Exception as e:
+        logger.exception("upload_image_dataset failed")
+        return jsonify({"error": f"Upload failed: {e}"}), 500
 
 
 @app.route("/api/chat", methods=["POST"])
@@ -286,18 +445,7 @@ def list_datasets():
         pass
 
     # Fallback: local scan
-    datasets = []
-    if os.path.isdir(UPLOAD_FOLDER):
-        for fname in os.listdir(UPLOAD_FOLDER):
-            fpath = os.path.join(UPLOAD_FOLDER, fname)
-            if os.path.isfile(fpath) and fname.endswith((".csv", ".json", ".txt")):
-                datasets.append({
-                    "filename": fname,
-                    "key": fpath,
-                    "size": os.path.getsize(fpath),
-                    "source": "local",
-                })
-    return jsonify({"datasets": datasets})
+    return jsonify({"datasets": _list_local_datasets()})
 
 
 @app.route("/api/select-dataset", methods=["POST"])
@@ -308,24 +456,20 @@ def select_dataset():
     filename = data.get("filename")
     source = data.get("source", "local")
     data_type = data.get("data_type", "text")
+    dataset_type = data.get("dataset_type", "file")
     if not filename:
         return jsonify({"error": "No filename provided"}), 400
 
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
+    file_path = _resolve_dataset_path(filename)
+    if dataset_type == "folder" or os.path.isdir(file_path):
+        dataset_type = "folder"
+        data_type = "image"
 
     # If dataset lives in RustFS but not locally, fetch it first
     if source == "restfs" and not os.path.exists(file_path):
-        try:
-            fetch_resp = _proxy_post(
-                f"{AI_OUTPUTS_SERVICE_URL}/api/fetch-dataset",
-                {"user_id": _user_id(), "filename": filename},
-                timeout=30,
-            )
-            if fetch_resp.status_code != 200:
-                return jsonify({"error": f"Failed to fetch dataset from RustFS: {fetch_resp.text}"}), 500
-            file_path = fetch_resp.json().get("file_path", file_path)
-        except Exception as e:
-            return jsonify({"error": f"Failed to fetch dataset from RustFS: {e}"}), 500
+        file_path, err = _fetch_dataset_from_restfs(filename, dataset_type=dataset_type)
+        if file_path is None:
+            return jsonify({"error": f"Failed to fetch dataset from RustFS: {err}"}), 500
 
     if not os.path.exists(file_path):
         return jsonify({"error": f"Dataset not found: {filename}"}), 404
@@ -341,6 +485,7 @@ def select_dataset():
             return jsonify({
                 "message": f'Dataset "{filename}" loaded successfully',
                 "file_path": file_path,
+                "dataset_type": dataset_type,
                 "data_summary": result.get("data_summary", {}),
             })
         return jsonify({"error": "Ingestion failed"}), 500
@@ -545,6 +690,12 @@ def xai_uc1_images_from_current():
         n = int(request.args.get("n", 50))
         if not filename:
             return jsonify({"images": [], "error": "No dataset filename provided"}), 400
+
+        folder_path = os.path.join(UPLOAD_FOLDER, filename)
+        if os.path.isdir(folder_path) and is_image_folder(folder_path):
+            images = collect_images_from_folder(folder_path, UPLOAD_FOLDER, limit=n)
+            return jsonify({"images": images, "total": len(images), "filename": filename, "dataset_type": "folder"})
+
         safe = secure_filename(filename)
         if not safe:
             return jsonify({"images": [], "error": "invalid filename"}), 400
@@ -556,13 +707,32 @@ def xai_uc1_images_from_current():
         else:
             raw, err = _psx_load_dataset_file(filename)
             if raw is None:
-                return jsonify({"images": [], "error": err or f"File not found: {safe}"}), 404
-        images = _psx_collect_image_paths_from_dataset(raw, filename, n)
+                manifest_name = f"{filename}_manifest.csv"
+                manifest_path = os.path.join(UPLOAD_FOLDER, manifest_name)
+                if os.path.isfile(manifest_path):
+                    with open(manifest_path, "rb") as f:
+                        raw = f.read()
+                    safe = manifest_name
+                else:
+                    return jsonify({"images": [], "error": err or f"File not found: {safe}"}), 404
+        images = _psx_collect_image_paths_from_dataset(raw, safe, n)
         if not images:
-            uploads_dir = UPLOAD_FOLDER
-            for fname in sorted(os.listdir(uploads_dir)):
-                if fname.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")):
-                    images.append({"index": len(images), "path": fname, "label": fname})
+            for entry in _list_local_datasets():
+                if entry.get("dataset_type") == "folder":
+                    images.extend(
+                        collect_images_from_folder(entry["key"], UPLOAD_FOLDER, limit=n - len(images))
+                    )
+                    if len(images) >= n:
+                        break
+            if not images:
+                uploads_dir = UPLOAD_FOLDER
+                for root, _dirs, files in os.walk(uploads_dir):
+                    for fname in sorted(files):
+                        if fname.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")):
+                            rel = os.path.relpath(os.path.join(root, fname), uploads_dir).replace("\\", "/")
+                            images.append({"index": len(images), "path": rel, "label": fname})
+                            if len(images) >= n:
+                                break
                     if len(images) >= n:
                         break
         return jsonify({"images": images, "total": len(images), "filename": safe})
@@ -615,6 +785,27 @@ def xai_uc1_serve_uploaded_image(filename):
 
 def _read_uc1_image_bytes_from_ref(image_ref: str) -> Optional[bytes]:
     """Load UC1 image bytes from RustFS, else from shared uploads (same basename or relative path)."""
+    if image_ref.startswith("local://uploads/"):
+        rel = image_ref.removeprefix("local://uploads/").replace("\\", "/").lstrip("/")
+        parts = [p for p in rel.split("/") if p and p not in ("..", ".")]
+        if not parts:
+            return None
+        file_path = os.path.abspath(os.path.join(UPLOAD_FOLDER, *parts))
+        base_abs = os.path.abspath(UPLOAD_FOLDER)
+        if not file_path.startswith(base_abs + os.sep) and file_path != base_abs:
+            return None
+        if os.path.isfile(file_path):
+            with open(file_path, "rb") as f:
+                return f.read()
+        safe = secure_filename(parts[-1])
+        for root, _dirs, files in os.walk(UPLOAD_FOLDER):
+            if safe in files:
+                cand = os.path.join(root, safe)
+                if os.path.abspath(cand).startswith(base_abs + os.sep):
+                    with open(cand, "rb") as f:
+                        return f.read()
+        return None
+
     from minio import Minio
 
     endpoint = os.environ.get("RESTFS_ENDPOINT", "rustfs.extra-brain.unparallel.pt")
@@ -656,6 +847,20 @@ def _read_uc1_image_bytes_from_ref(image_ref: str) -> Optional[bytes]:
 def _ensure_minio_ref_for_uc1_saliency(image_ref: str) -> str:
     """If the object exists in RustFS, return ref; else upload local bytes to a temp key for xai-api."""
     from minio import Minio
+
+    if image_ref.startswith("local://"):
+        b = _read_uc1_image_bytes_from_ref(image_ref)
+        if b is None:
+            raise ValueError("Could not resolve image bytes for saliency")
+        endpoint = os.environ.get("RESTFS_ENDPOINT", "rustfs.extra-brain.unparallel.pt")
+        access_key = os.environ.get("RESTFS_ACCESS_KEY", "")
+        secret_key = os.environ.get("RESTFS_SECRET_KEY", "")
+        secure = os.environ.get("RESTFS_SECURE", "true").lower() == "true"
+        client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
+        uc1_bucket = os.environ.get("UC1_BUCKET", "uc1-robotics")
+        key = f"{_user_id()}/xai_temp/{uuid.uuid4().hex}.jpg"
+        client.put_object(uc1_bucket, key, io.BytesIO(b), length=len(b), content_type="image/jpeg")
+        return f"minio://{uc1_bucket}/{key}"
 
     endpoint = os.environ.get("RESTFS_ENDPOINT", "rustfs.extra-brain.unparallel.pt")
     access_key = os.environ.get("RESTFS_ACCESS_KEY", "")
@@ -961,6 +1166,8 @@ def xai_uc2_lime():
 
 def _parse_minio_ref(ref: str):
     """Parse 'minio://bucket/path/to/object' -> (bucket, object_name)."""
+    if ref.startswith("local://"):
+        return "", ref
     without_scheme = ref.removeprefix("minio://")
     bucket, _, object_name = without_scheme.partition("/")
     return bucket, object_name

@@ -2147,11 +2147,28 @@ def list_user_datasets_restfs(user_id):
             import restfs_client as _restfs
             if _restfs.is_available():
                 for obj in _restfs.list_user_datasets(user_id):
-                    fname = obj['key'].split('/')[-1] if '/' in obj['key'] else obj['key']
-                    datasets.append({'filename': fname, 'key': obj['key'],
-                                     'size': obj.get('size', 0),
-                                     'last_modified': obj.get('last_modified'),
-                                     'source': 'restfs'})
+                    key = obj['key']
+                    fname = key.split('/')[-1] if '/' in key else key
+                    if fname.endswith('.zip'):
+                        datasets.append({
+                            'filename': fname[:-4],
+                            'key': key,
+                            'size': obj.get('size', 0),
+                            'last_modified': obj.get('last_modified'),
+                            'source': 'restfs',
+                            'dataset_type': 'folder',
+                        })
+                    elif fname.endswith('_manifest.csv'):
+                        continue
+                    else:
+                        datasets.append({
+                            'filename': fname,
+                            'key': key,
+                            'size': obj.get('size', 0),
+                            'last_modified': obj.get('last_modified'),
+                            'source': 'restfs',
+                            'dataset_type': 'file',
+                        })
         except Exception:
             pass
 
@@ -2160,17 +2177,47 @@ def list_user_datasets_restfs(user_id):
             for fname in os.listdir(uploads_dir):
                 fpath = os.path.join(uploads_dir, fname)
                 if os.path.isfile(fpath) and fname.endswith(('.csv', '.json', '.txt')):
-                    datasets.append({'filename': fname, 'key': fpath,
-                                     'size': os.path.getsize(fpath),
-                                     'last_modified': datetime.fromtimestamp(
-                                         os.path.getmtime(fpath)).isoformat(),
-                                     'source': 'local'})
+                    if fname.endswith('_manifest.csv'):
+                        continue
+                    datasets.append({
+                        'filename': fname,
+                        'key': fpath,
+                        'size': os.path.getsize(fpath),
+                        'last_modified': datetime.fromtimestamp(
+                            os.path.getmtime(fpath)).isoformat(),
+                        'source': 'local',
+                        'dataset_type': 'file',
+                    })
+                elif os.path.isdir(fpath):
+                    has_images = False
+                    for root, _dirs, files in os.walk(fpath):
+                        if any(f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif')) for f in files):
+                            has_images = True
+                            break
+                    if has_images or os.path.isfile(os.path.join(fpath, 'data.yaml')):
+                        total = 0
+                        for root, _dirs, files in os.walk(fpath):
+                            for f in files:
+                                try:
+                                    total += os.path.getsize(os.path.join(root, f))
+                                except OSError:
+                                    pass
+                        datasets.append({
+                            'filename': fname,
+                            'key': fpath,
+                            'size': total,
+                            'last_modified': datetime.fromtimestamp(
+                                os.path.getmtime(fpath)).isoformat(),
+                            'source': 'local',
+                            'dataset_type': 'folder',
+                        })
 
         seen = set()
         unique = []
         for d in datasets:
-            if d['filename'] not in seen:
-                seen.add(d['filename'])
+            dedupe_key = (d['filename'], d.get('dataset_type', 'file'))
+            if dedupe_key not in seen:
+                seen.add(dedupe_key)
                 unique.append(d)
         return jsonify({'datasets': unique})
     except Exception as e:
@@ -2180,15 +2227,78 @@ def list_user_datasets_restfs(user_id):
 
 @app.route('/api/store-dataset', methods=['POST'])
 def store_dataset_to_restfs():
-    """Persist an uploaded dataset file to RustFS so it survives container restarts.
-    Reads from shared_volume/uploads/{filename} and uploads to xai-datasets/{user_id}/{filename}."""
+    """Persist an uploaded dataset file or image folder to RustFS so it survives container restarts."""
     try:
+        import base64
+        import io as _io
+        import zipfile
+
         data = request.json or {}
         user_id = data.get('user_id')
         filename = data.get('filename')
+        dataset_type = data.get('dataset_type', 'file')
 
         if not user_id or not filename:
             return jsonify({'error': 'Missing user_id or filename'}), 400
+
+        import restfs_client as _restfs
+        if not _restfs.is_available():
+            return jsonify({'error': 'RustFS not available'}), 503
+
+        if dataset_type == 'folder':
+            zip_bytes = None
+            if data.get('zip_bytes_b64'):
+                zip_bytes = base64.b64decode(data['zip_bytes_b64'])
+            else:
+                folder_path = os.path.join(SHARED_DATA_DIR, 'uploads', filename)
+                if not os.path.isdir(folder_path):
+                    return jsonify({'error': f'Folder not found: {filename}'}), 404
+                buf = _io.BytesIO()
+                with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for root, _dirs, files in os.walk(folder_path):
+                        for fname in files:
+                            full = os.path.join(root, fname)
+                            arcname = os.path.join(
+                                filename,
+                                os.path.relpath(full, folder_path),
+                            )
+                            zf.write(full, arcname)
+                zip_bytes = buf.getvalue()
+
+            zip_name = f'{filename}.zip'
+            key = _restfs.save_dataset(
+                zip_bytes,
+                user_id,
+                zip_name,
+                content_type='application/zip',
+            )
+            if not key:
+                return jsonify({'error': 'Failed to upload folder zip to RustFS'}), 500
+
+            manifest_filename = data.get('manifest_filename')
+            if manifest_filename:
+                manifest_path = os.path.join(SHARED_DATA_DIR, 'uploads', manifest_filename)
+                if os.path.isfile(manifest_path):
+                    with open(manifest_path, 'rb') as mf:
+                        _restfs.save_dataset(
+                            mf.read(),
+                            user_id,
+                            manifest_filename,
+                            content_type='text/csv',
+                        )
+
+            logger.info(
+                "Image folder %s stored in RustFS for user %s (%d bytes zip)",
+                filename,
+                user_id,
+                len(zip_bytes),
+            )
+            return jsonify({
+                'message': 'Image folder stored in RustFS',
+                'key': key,
+                'size': len(zip_bytes),
+                'dataset_type': 'folder',
+            })
 
         file_path = os.path.join(SHARED_DATA_DIR, 'uploads', filename)
         if not os.path.isfile(file_path):
@@ -2197,17 +2307,12 @@ def store_dataset_to_restfs():
         with open(file_path, 'rb') as f:
             file_bytes = f.read()
 
-        # Determine content type from extension
         ext = os.path.splitext(filename)[1].lower()
         content_type = {
             '.csv': 'text/csv',
             '.json': 'application/json',
             '.txt': 'text/plain',
         }.get(ext, 'application/octet-stream')
-
-        import restfs_client as _restfs
-        if not _restfs.is_available():
-            return jsonify({'error': 'RustFS not available'}), 503
 
         key = _restfs.save_dataset(file_bytes, user_id, filename, content_type)
         if not key:
@@ -2218,6 +2323,7 @@ def store_dataset_to_restfs():
             'message': f'Dataset stored in RustFS',
             'key': key,
             'size': len(file_bytes),
+            'dataset_type': 'file',
         })
     except Exception as e:
         logger.exception('store_dataset_to_restfs failed')
@@ -2226,12 +2332,15 @@ def store_dataset_to_restfs():
 
 @app.route('/api/fetch-dataset', methods=['POST'])
 def fetch_dataset_from_restfs():
-    """Download a dataset from RustFS to shared_volume/uploads/ so xai_service can ingest it.
-    Used when user selects a RustFS-only dataset."""
+    """Download a dataset from RustFS to shared_volume/uploads/ so xai_service can ingest it."""
     try:
+        import io as _io
+        import zipfile
+
         data = request.json or {}
         user_id = data.get('user_id')
         filename = data.get('filename')
+        dataset_type = data.get('dataset_type', 'file')
 
         if not user_id or not filename:
             return jsonify({'error': 'Missing user_id or filename'}), 400
@@ -2240,22 +2349,72 @@ def fetch_dataset_from_restfs():
         if not _restfs.is_available():
             return jsonify({'error': 'RustFS not available'}), 503
 
+        uploads_dir = os.path.join(SHARED_DATA_DIR, 'uploads')
+        os.makedirs(uploads_dir, exist_ok=True)
+
+        if dataset_type == 'folder':
+            folder_path = os.path.join(uploads_dir, filename)
+            if os.path.isdir(folder_path):
+                return jsonify({
+                    'message': 'Folder already present locally',
+                    'file_path': folder_path,
+                    'dataset_type': 'folder',
+                })
+
+            zip_bytes = _restfs.get_dataset(user_id, f'{filename}.zip')
+            if zip_bytes is None:
+                return jsonify({'error': f'Folder dataset not found in RustFS: {filename}'}), 404
+
+            with zipfile.ZipFile(_io.BytesIO(zip_bytes)) as zf:
+                zf.extractall(uploads_dir)
+
+            if not os.path.isdir(folder_path):
+                for entry in os.listdir(uploads_dir):
+                    candidate = os.path.join(uploads_dir, entry)
+                    if os.path.isdir(candidate) and (
+                        os.path.isfile(os.path.join(candidate, 'data.yaml'))
+                        or any(
+                            f.lower().endswith(('.jpg', '.jpeg', '.png'))
+                            for _r, _d, files in os.walk(candidate)
+                            for f in files
+                        )
+                    ):
+                        folder_path = candidate
+                        break
+
+            manifest_name = f'{filename}_manifest.csv'
+            manifest_bytes = _restfs.get_dataset(user_id, manifest_name)
+            if manifest_bytes:
+                with open(os.path.join(uploads_dir, manifest_name), 'wb') as mf:
+                    mf.write(manifest_bytes)
+
+            logger.info("Folder dataset %s fetched from RustFS to %s", filename, folder_path)
+            return jsonify({
+                'message': 'Folder dataset fetched from RustFS',
+                'file_path': folder_path,
+                'dataset_type': 'folder',
+            })
+
+        file_path = os.path.join(uploads_dir, filename)
+        if os.path.isfile(file_path):
+            return jsonify({
+                'message': 'File already present locally',
+                'file_path': file_path,
+                'dataset_type': 'file',
+            })
+
         file_bytes = _restfs.get_dataset(user_id, filename)
         if file_bytes is None:
             return jsonify({'error': f'Dataset not found in RustFS: {filename}'}), 404
 
-        # Save to shared uploads so xai_service can access it
-        uploads_dir = os.path.join(SHARED_DATA_DIR, 'uploads')
-        os.makedirs(uploads_dir, exist_ok=True)
-        file_path = os.path.join(uploads_dir, filename)
         with open(file_path, 'wb') as f:
             f.write(file_bytes)
 
         logger.info("Dataset %s fetched from RustFS to %s (%d bytes)", filename, file_path, len(file_bytes))
         return jsonify({
-            'message': f'Dataset fetched from RustFS',
+            'message': 'Dataset fetched from RustFS',
             'file_path': file_path,
-            'size': len(file_bytes),
+            'dataset_type': 'file',
         })
     except Exception as e:
         logger.exception('fetch_dataset_from_restfs failed')

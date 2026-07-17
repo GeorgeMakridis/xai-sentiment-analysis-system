@@ -7,11 +7,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import json
 import logging
 import base64
 import io
+import os
 import numpy as np
 
 # Optional PIL import for image processing (if needed in future)
@@ -23,6 +24,12 @@ except ImportError:
     Image = None
 
 logger = logging.getLogger(__name__)
+
+# Shared uploads root inside Docker; also try local workspace layout for offline runs.
+_UPLOAD_CANDIDATES = [
+    os.environ.get("SHARED_DATA_DIR", "/app/shared_data"),
+    "/app/shared_data",
+]
 
 # Try to import openai, but allow fallback if not available
 try:
@@ -96,8 +103,17 @@ class ImagePlotGenerator(BasePlotGenerator):
         
         for col in data.columns:
             col_lower = col.lower()
-            # Check column name
-            if any(term in col_lower for term in ['image', 'img', 'picture', 'photo', 'file_path', 'path']):
+            # Prefer explicit image path columns first
+            if col_lower in ('image_path', 'image', 'img', 'file_path', 'filename'):
+                image_cols.append(col)
+                continue
+            # Check column name (avoid matching label_names via 'path' alone)
+            if any(term in col_lower for term in ['image', 'img', 'picture', 'photo', 'file_path']):
+                if 'label' in col_lower:
+                    continue
+                image_cols.append(col)
+                continue
+            if col_lower.endswith('_path') or col_lower == 'path':
                 image_cols.append(col)
                 continue
             
@@ -117,6 +133,127 @@ class ImagePlotGenerator(BasePlotGenerator):
                         image_cols.append(col)
         
         return image_cols
+
+    def _resolve_label_column(self, data: pd.DataFrame) -> Optional[str]:
+        """Prefer exact label/class columns over label_names."""
+        for preferred in ('label', 'digit', 'class', 'category', 'target'):
+            for col in data.columns:
+                if col.lower() == preferred:
+                    return col
+        for col in data.columns:
+            cl = col.lower()
+            if cl == 'label_names':
+                continue
+            if any(term in cl for term in ('label', 'class', 'category', 'digit')):
+                return col
+        return None
+
+    def _uploads_roots(self) -> List[str]:
+        roots = []
+        for base in _UPLOAD_CANDIDATES:
+            if not base:
+                continue
+            uploads = os.path.join(base, "uploads") if not base.endswith("uploads") else base
+            if uploads not in roots:
+                roots.append(uploads)
+            if base not in roots:
+                roots.append(base)
+        # Local repo fallback when running outside Docker
+        here = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "shared_volume", "uploads"))
+        if here not in roots:
+            roots.append(here)
+        return roots
+
+    def _resolve_image_path(self, value: str) -> Optional[str]:
+        """Resolve a relative/absolute image path under shared uploads."""
+        raw = (value or "").strip().replace("\\", "/")
+        if not raw:
+            return None
+        if os.path.isfile(raw):
+            return raw
+        for root in self._uploads_roots():
+            candidate = os.path.join(root, raw)
+            if os.path.isfile(candidate):
+                return candidate
+            # basename search as last resort
+            base = os.path.basename(raw)
+            for dirpath, _dirs, files in os.walk(root):
+                if base in files:
+                    return os.path.join(dirpath, base)
+        return None
+
+    def _load_pil_image(self, value: Any, convert_rgb: bool = False):
+        """
+        Load a PIL image from base64 data URL / raw base64 OR a filesystem path.
+        Returns None when the value cannot be opened.
+        """
+        if not PIL_AVAILABLE or value is None or (isinstance(value, float) and np.isnan(value)):
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+        try:
+            img = None
+            if raw.startswith("data:image"):
+                b64 = raw.split(",", 1)[1] if "," in raw else raw
+                img = Image.open(io.BytesIO(base64.b64decode(b64)))
+            elif raw.startswith("iVBORw0KGgo") or (len(raw) > 256 and all(
+                c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r"
+                for c in raw[:120]
+            )):
+                img = Image.open(io.BytesIO(base64.b64decode(raw)))
+            else:
+                path = self._resolve_image_path(raw)
+                if path:
+                    img = Image.open(path)
+            if img is None:
+                return None
+            if convert_rgb:
+                return img.convert("RGB")
+            return img
+        except Exception as e:
+            logger.debug("Could not load image from value=%s: %s", raw[:80], e)
+            return None
+
+    def _image_to_data_uri(self, value: Any, max_side: int = 256) -> Optional[str]:
+        """Return a data URI suitable for HTML <img src=...> from path or base64."""
+        if value is None:
+            return None
+        raw = str(value).strip()
+        if raw.startswith("data:image"):
+            return raw
+        img = self._load_pil_image(raw, convert_rgb=True)
+        if img is None:
+            return None
+        try:
+            w, h = img.size
+            scale = min(1.0, float(max_side) / max(w, h))
+            if scale < 1.0:
+                img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+            return f"data:image/jpeg;base64,{encoded}"
+        except Exception as e:
+            logger.debug("Could not encode image to data URI: %s", e)
+            return None
+
+    def expand_multilabel_counts(self, data: pd.DataFrame) -> Optional[pd.Series]:
+        """Expand comma-separated label_names into per-class occurrence counts."""
+        if "label_names" in data.columns:
+            counts: Dict[str, int] = {}
+            for val in data["label_names"].dropna():
+                for part in str(val).split(","):
+                    name = part.strip()
+                    if not name:
+                        continue
+                    counts[name] = counts.get(name, 0) + 1
+            if counts:
+                return pd.Series(counts).sort_values(ascending=False)
+        label_col = self._resolve_label_column(data)
+        if label_col:
+            return data[label_col].value_counts()
+        return None
     
     def generate_plot(self, query: str, data: pd.DataFrame, 
                      user_id: str, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -526,15 +663,13 @@ Respond ONLY with valid JSON, no markdown."""
     def _create_image_grid(self, data: pd.DataFrame, plot_spec: Dict[str, Any], title: str):
         """Create image grid visualization with actual images displayed"""
         image_cols = self._find_image_columns(data)
-        metadata_cols = [col for col in data.columns 
-                        if any(term in col.lower() for term in ['label', 'class', 'category', 'digit'])]
+        label_col = self._resolve_label_column(data)
         
         if not image_cols:
             # Fallback to metadata visualization
             return self._create_classification_distribution(data, plot_spec, title)
         
         image_col = image_cols[0]
-        label_col = metadata_cols[0] if metadata_cols else None
         
         # Limit to reasonable number of images for display (max 20)
         max_images = min(20, len(data))
@@ -547,9 +682,11 @@ Respond ONLY with valid JSON, no markdown."""
             
             for label, group in grouped:
                 for idx, (_, row) in enumerate(group.head(3).iterrows()):  # Max 3 per class
-                    image_data = str(row[image_col])
+                    uri = self._image_to_data_uri(row[image_col])
+                    if not uri:
+                        continue
                     html_images.append({
-                        'image': image_data,
+                        'image': uri,
                         'label': row[label_col],
                         'id': f"img_{len(html_images)}"
                     })
@@ -560,13 +697,17 @@ Respond ONLY with valid JSON, no markdown."""
         else:
             # Just take first N images
             html_images = []
-            for idx, (_, row) in enumerate(data.head(max_images).iterrows()):
-                image_data = str(row[image_col])
+            for idx, (_, row) in enumerate(data.head(max_images * 2).iterrows()):
+                uri = self._image_to_data_uri(row[image_col])
+                if not uri:
+                    continue
                 html_images.append({
-                    'image': image_data,
+                    'image': uri,
                     'label': None,
                     'id': f"img_{idx}"
                 })
+                if len(html_images) >= max_images:
+                    break
         
         # Create HTML-based image grid (will be embedded in Plotly HTML)
         n_cols = 5
@@ -998,65 +1139,71 @@ Respond ONLY with valid JSON, no markdown."""
         
         for idx, row in data.head(sample_size).iterrows():
             try:
-                image_data = str(row[image_col])
-                if image_data.startswith('data:image'):
-                    # Extract base64 part
-                    base64_data = image_data.split(',')[1] if ',' in image_data else image_data
-                    img_bytes = base64.b64decode(base64_data)
-                    img = Image.open(io.BytesIO(img_bytes))
-                    
-                    width, height = img.size
-                    aspect_ratio = width / height if height > 0 else 0
-                    file_size = len(img_bytes)
-                    
-                    stats['widths'].append(width)
-                    stats['heights'].append(height)
-                    stats['aspect_ratios'].append(aspect_ratio)
-                    stats['file_sizes'].append(file_size)
-                    
-                    # Color channel statistics (convert to RGB if needed)
-                    img_rgb = img.convert('RGB')
-                    img_array = np.array(img_rgb)
-                    
-                    # Calculate mean and std for each channel
-                    r_mean = np.mean(img_array[:, :, 0])
-                    g_mean = np.mean(img_array[:, :, 1])
-                    b_mean = np.mean(img_array[:, :, 2])
-                    r_std = np.std(img_array[:, :, 0])
-                    g_std = np.std(img_array[:, :, 1])
-                    b_std = np.std(img_array[:, :, 2])
-                    
-                    stats['color_channels']['r_mean'].append(r_mean)
-                    stats['color_channels']['g_mean'].append(g_mean)
-                    stats['color_channels']['b_mean'].append(b_mean)
-                    stats['color_channels']['r_std'].append(r_std)
-                    stats['color_channels']['g_std'].append(g_std)
-                    stats['color_channels']['b_std'].append(b_std)
-                    
-                    # Calculate saturation (HSV color space)
-                    img_hsv = img.convert('HSV')
-                    hsv_array = np.array(img_hsv)
-                    saturation = np.mean(hsv_array[:, :, 1])  # S channel
-                    stats['saturation'].append(saturation)
-                    
-                    # Data quality metrics
-                    # Convert to grayscale for quality metrics
-                    gray = img.convert('L')
-                    gray_array = np.array(gray)
-                    
-                    # Sharpness: Laplacian variance (higher = sharper)
-                    if SCIPY_AVAILABLE:
-                        try:
-                            laplacian = ndimage.laplace(gray_array)
-                            sharpness = np.var(laplacian)
-                            stats['quality']['sharpness'].append(sharpness)
-                        except Exception as e:
-                            logger.debug(f"Could not calculate sharpness: {e}")
-                    
-                    # Contrast: Standard deviation of pixel intensities
-                    contrast = np.std(gray_array)
-                    stats['quality']['contrast'].append(contrast)
-                    
+                img = self._load_pil_image(row[image_col])
+                if img is None:
+                    continue
+
+                width, height = img.size
+                aspect_ratio = width / height if height > 0 else 0
+                # Approximate file size from path or in-memory PNG encode
+                file_size = 0
+                raw_val = str(row[image_col])
+                resolved = self._resolve_image_path(raw_val) if not raw_val.startswith("data:image") else None
+                if resolved and os.path.isfile(resolved):
+                    file_size = os.path.getsize(resolved)
+                else:
+                    buf = io.BytesIO()
+                    img.save(buf, format="PNG")
+                    file_size = len(buf.getvalue())
+
+                stats['widths'].append(width)
+                stats['heights'].append(height)
+                stats['aspect_ratios'].append(aspect_ratio)
+                stats['file_sizes'].append(file_size)
+
+                # Color channel statistics (convert to RGB if needed)
+                img_rgb = img.convert('RGB')
+                img_array = np.array(img_rgb)
+
+                # Calculate mean and std for each channel
+                r_mean = np.mean(img_array[:, :, 0])
+                g_mean = np.mean(img_array[:, :, 1])
+                b_mean = np.mean(img_array[:, :, 2])
+                r_std = np.std(img_array[:, :, 0])
+                g_std = np.std(img_array[:, :, 1])
+                b_std = np.std(img_array[:, :, 2])
+
+                stats['color_channels']['r_mean'].append(r_mean)
+                stats['color_channels']['g_mean'].append(g_mean)
+                stats['color_channels']['b_mean'].append(b_mean)
+                stats['color_channels']['r_std'].append(r_std)
+                stats['color_channels']['g_std'].append(g_std)
+                stats['color_channels']['b_std'].append(b_std)
+
+                # Calculate saturation (HSV color space)
+                img_hsv = img.convert('HSV')
+                hsv_array = np.array(img_hsv)
+                saturation = np.mean(hsv_array[:, :, 1])  # S channel
+                stats['saturation'].append(saturation)
+
+                # Data quality metrics
+                # Convert to grayscale for quality metrics
+                gray = img.convert('L')
+                gray_array = np.array(gray)
+
+                # Sharpness: Laplacian variance (higher = sharper)
+                if SCIPY_AVAILABLE:
+                    try:
+                        laplacian = ndimage.laplace(gray_array)
+                        sharpness = np.var(laplacian)
+                        stats['quality']['sharpness'].append(sharpness)
+                    except Exception as e:
+                        logger.debug(f"Could not calculate sharpness: {e}")
+
+                # Contrast: Standard deviation of pixel intensities
+                contrast = np.std(gray_array)
+                stats['quality']['contrast'].append(contrast)
+
             except Exception as e:
                 logger.debug(f"Could not process image {idx}: {e}")
                 continue
@@ -1246,11 +1393,7 @@ Respond ONLY with valid JSON, no markdown."""
             from torchvision.models import resnet18
             
             # Check if we have labels
-            label_col = None
-            for col in data.columns:
-                if any(term in col.lower() for term in ['label', 'class', 'category', 'digit']):
-                    label_col = col
-                    break
+            label_col = self._resolve_label_column(data)
             
             if not label_col:
                 return self._create_classification_distribution(data, plot_spec, title)
@@ -1283,17 +1426,15 @@ Respond ONLY with valid JSON, no markdown."""
             
             for idx, row in data.head(sample_size).iterrows():
                 try:
-                    image_data = str(row[image_cols[0]])
-                    if image_data.startswith('data:image'):
-                        base64_data = image_data.split(',')[1] if ',' in image_data else image_data
-                        img_bytes = base64.b64decode(base64_data)
-                        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-                        img_tensor = transform(img).unsqueeze(0)
-                        
-                        with torch.no_grad():
-                            embedding = model(img_tensor).squeeze().numpy().flatten()
-                            embeddings.append(embedding)
-                            labels.append(row[label_col])
+                    img = self._load_pil_image(row[image_cols[0]], convert_rgb=True)
+                    if img is None:
+                        continue
+                    img_tensor = transform(img).unsqueeze(0)
+
+                    with torch.no_grad():
+                        embedding = model(img_tensor).squeeze().numpy().flatten()
+                        embeddings.append(embedding)
+                        labels.append(row[label_col])
                 except Exception as e:
                     logger.debug(f"Could not process image {idx}: {e}")
                     continue
@@ -1351,11 +1492,7 @@ Respond ONLY with valid JSON, no markdown."""
             from torchvision import transforms
             from torchvision.models import resnet18
             
-            label_col = None
-            for col in data.columns:
-                if any(term in col.lower() for term in ['label', 'class', 'category', 'digit']):
-                    label_col = col
-                    break
+            label_col = self._resolve_label_column(data)
             
             if not label_col:
                 return self._create_classification_distribution(data, plot_spec, title)
@@ -1401,17 +1538,15 @@ Respond ONLY with valid JSON, no markdown."""
             
             for idx, row in data.head(sample_size).iterrows():
                 try:
-                    image_data = str(row[image_cols[0]])
-                    if image_data.startswith('data:image'):
-                        base64_data = image_data.split(',')[1] if ',' in image_data else image_data
-                        img_bytes = base64.b64decode(base64_data)
-                        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-                        img_tensor = transform(img).unsqueeze(0)
-                        
-                        with torch.no_grad():
-                            embedding = model(img_tensor).squeeze().numpy().flatten()
-                            embeddings.append(embedding)
-                            labels.append(row[label_col])
+                    img = self._load_pil_image(row[image_cols[0]], convert_rgb=True)
+                    if img is None:
+                        continue
+                    img_tensor = transform(img).unsqueeze(0)
+
+                    with torch.no_grad():
+                        embedding = model(img_tensor).squeeze().numpy().flatten()
+                        embeddings.append(embedding)
+                        labels.append(row[label_col])
                 except Exception as e:
                     logger.debug(f"Could not process image {idx}: {e}")
                     continue
@@ -1591,13 +1726,11 @@ Respond ONLY with valid JSON, no markdown."""
             
             for idx, row in data.head(sample_size).iterrows():
                 try:
-                    image_data = str(row[image_col])
-                    if image_data.startswith('data:image'):
-                        base64_data = image_data.split(',')[1] if ',' in image_data else image_data
-                        img_bytes = base64.b64decode(base64_data)
-                        img = Image.open(io.BytesIO(img_bytes))
-                        phash = imagehash.phash(img)
-                        hashes[idx] = phash
+                    img = self._load_pil_image(row[image_col])
+                    if img is None:
+                        continue
+                    phash = imagehash.phash(img)
+                    hashes[idx] = phash
                 except Exception as e:
                     logger.debug(f"Could not hash image {idx}: {e}")
                     continue
@@ -1681,17 +1814,15 @@ Respond ONLY with valid JSON, no markdown."""
             
             for idx, row in data.head(sample_size).iterrows():
                 try:
-                    image_data = str(row[image_col])
-                    if image_data.startswith('data:image'):
-                        base64_data = image_data.split(',')[1] if ',' in image_data else image_data
-                        img_bytes = base64.b64decode(base64_data)
-                        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-                        img_tensor = transform(img).unsqueeze(0)
-                        
-                        with torch.no_grad():
-                            embedding = model(img_tensor).squeeze().numpy().flatten()
-                            embeddings.append(embedding)
-                            indices.append(idx)
+                    img = self._load_pil_image(row[image_col], convert_rgb=True)
+                    if img is None:
+                        continue
+                    img_tensor = transform(img).unsqueeze(0)
+
+                    with torch.no_grad():
+                        embedding = model(img_tensor).squeeze().numpy().flatten()
+                        embeddings.append(embedding)
+                        indices.append(idx)
                 except Exception as e:
                     logger.debug(f"Could not process image {idx}: {e}")
                     continue
@@ -1795,11 +1926,7 @@ Respond ONLY with valid JSON, no markdown."""
             from torchvision import transforms
             from torchvision.models import resnet18
             
-            label_col = None
-            for col in data.columns:
-                if any(term in col.lower() for term in ['label', 'class', 'category', 'digit']):
-                    label_col = col
-                    break
+            label_col = self._resolve_label_column(data)
             
             if not label_col:
                 return self._create_classification_distribution(data, plot_spec, title)
@@ -1834,16 +1961,14 @@ Respond ONLY with valid JSON, no markdown."""
                 
                 for idx, row in class_data.iterrows():
                     try:
-                        image_data = str(row[image_cols[0]])
-                        if image_data.startswith('data:image') or image_data.startswith('iVBORw0KGgo'):
-                            base64_data = image_data.split(',')[1] if ',' in image_data else image_data
-                            img_bytes = base64.b64decode(base64_data)
-                            img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-                            img_tensor = transform(img).unsqueeze(0)
-                            
-                            with torch.no_grad():
-                                embedding = model(img_tensor).squeeze().numpy().flatten()
-                                class_embeddings.append(embedding)
+                        img = self._load_pil_image(row[image_cols[0]], convert_rgb=True)
+                        if img is None:
+                            continue
+                        img_tensor = transform(img).unsqueeze(0)
+
+                        with torch.no_grad():
+                            embedding = model(img_tensor).squeeze().numpy().flatten()
+                            class_embeddings.append(embedding)
                     except Exception as e:
                         logger.debug(f"Could not process image for class {label}: {e}")
                         continue
@@ -1964,25 +2089,18 @@ Respond ONLY with valid JSON, no markdown."""
             
             for idx, row in data.head(sample_size).iterrows():
                 try:
-                    image_data = str(row[image_cols[0]])
-                    if image_data.startswith('data:image') or image_data.startswith('iVBORw0KGgo'):
-                        base64_data = image_data.split(',')[1] if ',' in image_data else image_data
-                        img_bytes = base64.b64decode(base64_data)
-                        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-                        img_tensor = transform(img).unsqueeze(0)
-                        
-                        with torch.no_grad():
-                            embedding = model(img_tensor).squeeze().numpy().flatten()
-                            embeddings.append(embedding)
-                            image_data_list.append(image_data)
-                            
-                            # Get label if available
-                            label_col = None
-                            for col in data.columns:
-                                if any(term in col.lower() for term in ['label', 'class', 'category', 'digit']):
-                                    label_col = col
-                                    break
-                            labels_list.append(row[label_col] if label_col else 'Unknown')
+                    img = self._load_pil_image(row[image_cols[0]], convert_rgb=True)
+                    if img is None:
+                        continue
+                    img_tensor = transform(img).unsqueeze(0)
+
+                    with torch.no_grad():
+                        embedding = model(img_tensor).squeeze().numpy().flatten()
+                        embeddings.append(embedding)
+                        image_data_list.append(str(row[image_cols[0]]))
+
+                        label_col = self._resolve_label_column(data)
+                        labels_list.append(row[label_col] if label_col else 'Unknown')
                 except Exception as e:
                     logger.debug(f"Could not process image {idx}: {e}")
                     continue

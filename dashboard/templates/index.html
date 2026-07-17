@@ -1177,6 +1177,17 @@
                     <div class="upload-description">Drag and drop your data file here or click to browse (CSV, JSON, TXT)</div>
                     <input type="file" id="dataFile" class="file-input" accept=".csv,.json,.txt">
                 </div>
+                <div class="upload-card" id="imageFolderUploadArea" style="margin-top: 12px;">
+                    <div class="upload-icon">📁</div>
+                    <div class="upload-title">Upload Image Folder</div>
+                    <div class="upload-description">Select a folder (YOLO/Roboflow export) or a .zip image dataset</div>
+                    <input type="file" id="imageFolderFiles" class="file-input" webkitdirectory directory multiple>
+                    <input type="file" id="imageFolderZip" class="file-input" accept=".zip" style="display:none;">
+                    <div style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;">
+                        <button type="button" class="action-btn" style="font-size:0.8rem; padding:8px 12px;" onclick="document.getElementById('imageFolderFiles').click()">📂 Choose Folder</button>
+                        <button type="button" class="action-btn" style="font-size:0.8rem; padding:8px 12px;" onclick="document.getElementById('imageFolderZip').click()">🗜️ Choose Zip</button>
+                    </div>
+                </div>
                 <div id="dataStatus"></div>
                 </div>
                 <div class="progress-indicator" id="uploadProgress">
@@ -1420,6 +1431,15 @@
             return fp.split(/[/\\\\]/).pop() || '';
         }
 
+        function getCurrentDatasetType() {
+            if (uploadedData && uploadedData.dataset_type) return uploadedData.dataset_type;
+            if (uploadedData && uploadedData.data_summary && uploadedData.data_summary.preprocessing_info) {
+                const fmt = uploadedData.data_summary.preprocessing_info.dataset_format;
+                if (fmt === 'yolo' || fmt === 'image_folder') return 'folder';
+            }
+            return 'file';
+        }
+
         function getUC2TextRef() {
             const fn = getCurrentDatasetFilename();
             if (!fn) return '';
@@ -1581,6 +1601,9 @@
             if (!v) return '';
             if (v.startsWith('train/')) {
                 return 'minio://uc1-robotics/' + v;
+            }
+            if (v.includes('/') || getCurrentDatasetType() === 'folder') {
+                return 'local://uploads/' + v;
             }
             return 'minio://uc1-robotics/' + PSX_USER_ID + '/' + v;
         }
@@ -1844,6 +1867,44 @@
             area.addEventListener('click', () => input.click());
         }
         
+        function uploadImageFolder(files, zipFile, statusElement) {
+            const formData = new FormData();
+            if (zipFile) {
+                formData.append('zip_file', zipFile);
+            } else if (files && files.length) {
+                const paths = [];
+                for (let i = 0; i < files.length; i++) {
+                    formData.append('files', files[i], files[i].webkitRelativePath || files[i].name);
+                    paths.push(files[i].webkitRelativePath || files[i].name);
+                }
+                formData.append('paths', paths.join('\n'));
+            } else {
+                statusElement.innerHTML = '<div class="status error">No folder files selected</div>';
+                return;
+            }
+            statusElement.innerHTML = '<div class="status loading"><span class="loading-text">Processing...</span> Uploading image folder...</div>';
+            fetch('/api/upload-image-dataset', { method: 'POST', body: formData })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) statusElement.innerHTML = `<div class="status error">${data.error}</div>`;
+                    else {
+                        statusElement.innerHTML = `<div class="status success">${data.message}</div>`;
+                        if (data.data_summary) {
+                            const ds = data.data_summary;
+                            if (ds.shape && Array.isArray(ds.shape) && ds.shape.length >= 2)
+                                document.getElementById('dataShape').textContent = `${ds.shape[0].toLocaleString()} × ${ds.shape[1]}`;
+                            if (ds.columns && Array.isArray(ds.columns)) document.getElementById('totalColumns').textContent = ds.columns.length;
+                            document.getElementById('summaryStats').style.display = 'block';
+                            updateUIForDataType(ds.data_type || 'image');
+                            loadDataStatistics();
+                        }
+                        uploadedData = data;
+                        refreshDatasets();
+                    }
+                })
+                .catch(err => statusElement.innerHTML = `<div class="status error">Upload failed: ${err.message}</div>`);
+        }
+
         function uploadFile(file, endpoint, statusElement) {
             const formData = new FormData();
             formData.append('file', file);
@@ -1897,7 +1958,7 @@
             const container = document.getElementById('resultsContainer');
             container.innerHTML = '';
             updateSummaryStats(data);
-            const vizTitles = { overview: 'Data Overview', sentiment_distribution: 'Sentiment Distribution', per_asset_sentiment: 'Per Asset Sentiment', keyword_insights: 'Keyword Insights', word_sentiment_associations: 'Word Sentiment Associations', asset_distribution: 'Asset Distribution', data_quality: 'Data Quality - Text Length Distribution', image_classification: '📸 Image Classification Distribution', image_grid: '📸 Sample Images by Class', image_overview: '📸 Image Data Overview', image_statistics: '📸 Image Statistics', embedding_visualization: '📸 Image Embedding Visualization', class_separability: '📸 Class Separability Analysis', class_similarity_matrix: '📸 Inter-Class Similarity Matrix (ResNet18)', nearest_neighbors: '📸 Nearest Neighbors Analysis (ResNet18)', duplicate_detection: '📸 Duplicate Detection', anomaly_detection: '📸 Anomaly Detection' };
+            const vizTitles = { overview: 'Data Overview', sentiment_distribution: 'Sentiment Distribution', per_asset_sentiment: 'Per Asset Sentiment', keyword_insights: 'Keyword Insights', word_sentiment_associations: 'Word Sentiment Associations', asset_distribution: 'Asset Distribution', data_quality: 'Data Quality - Text Length Distribution', image_classification: '📸 Image Classification Distribution', image_grid: '📸 Sample Images by Class', image_overview: '📸 Image Data Overview', image_statistics: '📸 Image Statistics', embedding_visualization: '📸 Image Embedding Visualization', class_separability: '📸 Class Separability Analysis', class_similarity_matrix: '📸 Inter-Class Similarity Matrix (ResNet18)', nearest_neighbors: '📸 Nearest Neighbors Analysis (ResNet18)', duplicate_detection: '📸 Duplicate Detection', anomaly_detection: '📸 Anomaly Detection', dataset_overview: '📸 Dataset Overview', train_test_distribution: '📸 Train / Valid / Test Split', objects_per_image: '📸 Objects per Image' };
             if (data.images && data.images.length > 0) {
                 data.images.forEach((item, i) => {
                     if (item.type === 'overview') return;
@@ -2024,17 +2085,21 @@
                 ds.forEach(d => {
                     const el = document.createElement('div');
                     el.className = 'dataset-item';
-                    el.onclick = (e) => { selectDataset(d.filename, d.source); document.querySelectorAll('.dataset-item').forEach(x => x.classList.remove('selected')); el.classList.add('selected'); };
-                    el.innerHTML = '<div class="ds-name" title="' + d.filename + '">' + d.filename + '</div><div class="ds-meta">' + (d.size ? Math.round(d.size/1024) : '?') + ' KB</div>';
+                    const dsType = d.dataset_type || 'file';
+                    el.onclick = (e) => { selectDataset(d.filename, d.source, dsType); document.querySelectorAll('.dataset-item').forEach(x => x.classList.remove('selected')); el.classList.add('selected'); };
+                    const typeBadge = dsType === 'folder' ? ' 📁' : '';
+                    el.innerHTML = '<div class="ds-name" title="' + d.filename + '">' + d.filename + typeBadge + '</div><div class="ds-meta">' + (d.size ? Math.round(d.size/1024) : '?') + ' KB</div>';
                     list.appendChild(el);
                 });
             }).catch(() => { list.innerHTML = '<div style="text-align: center; padding: 16px; color: #dc2626; font-size: 0.85rem;">Failed to load datasets</div>'; });
         }
         
-        function selectDataset(filename, source) {
+        function selectDataset(filename, source, datasetType) {
             const status = document.getElementById('datasetSelectStatus');
+            const inferredType = datasetType || 'file';
+            const dataType = inferredType === 'folder' ? 'image' : getSelectedDataType();
             status.innerHTML = '<div class="status loading">Loading ' + filename + '...</div>';
-            fetch('/api/select-dataset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename, source, data_type: getSelectedDataType() }) })
+            fetch('/api/select-dataset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename, source, data_type: dataType, dataset_type: inferredType }) })
                 .then(r => r.json())
                 .then(data => {
                     if (data.error) status.innerHTML = '<div class="status error">' + data.error + '</div>';
@@ -2045,7 +2110,7 @@
                             if (ds.shape && Array.isArray(ds.shape) && ds.shape.length >= 2) document.getElementById('dataShape').textContent = ds.shape[0].toLocaleString() + ' × ' + ds.shape[1];
                             if (ds.columns) document.getElementById('totalColumns').textContent = ds.columns.length;
                             document.getElementById('summaryStats').style.display = 'block';
-                            updateUIForDataType(ds.data_type || 'tabular');
+                            updateUIForDataType(ds.data_type || (inferredType === 'folder' ? 'image' : 'tabular'));
                         }
                         uploadedData = data;
                         loadDataStatistics();
@@ -2057,6 +2122,18 @@
         function toggleSection(el) { el.closest('.sidebar-section').classList.toggle('collapsed'); }
         
         setupFileUpload('dataFile', 'dataUploadArea', 'dataStatus', '/api/upload-data');
+        document.getElementById('imageFolderFiles').addEventListener('change', (e) => {
+            if (e.target.files && e.target.files.length) {
+                uploadImageFolder(e.target.files, null, document.getElementById('dataStatus'));
+                e.target.value = '';
+            }
+        });
+        document.getElementById('imageFolderZip').addEventListener('change', (e) => {
+            if (e.target.files && e.target.files[0]) {
+                uploadImageFolder(null, e.target.files[0], document.getElementById('dataStatus'));
+                e.target.value = '';
+            }
+        });
         addMessage('Hello! I am your AI assistant. Ask me questions about your data analysis and visualizations.', 'bot');
         setTimeout(refreshDatasets, 500);
     </script>
